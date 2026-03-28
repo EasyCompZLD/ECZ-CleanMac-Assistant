@@ -138,7 +138,7 @@ final class AppViewModel: ObservableObject {
     }
 
     var appVersionLabel: String {
-        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.1.0"
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? AppBuildFlavor.currentVersion
         return localized(
             "Version \(version) • \(AppBuildFlavor.buildLabel)",
             "Versie \(version) • \(AppBuildFlavor.buildLabel)"
@@ -345,17 +345,7 @@ final class AppViewModel: ObservableObject {
     }
 
     func runSmartCare() {
-        selectModule(.smartCare)
-        runModule(selectedModule)
-    }
-
-    func runModule(_ module: MaintenanceModule) {
         guard !isRunning else { return }
-        let tasks = MaintenanceCatalog.tasks(for: module.id).filter { enabledTaskIDs.contains($0.id) }
-        guard !tasks.isEmpty else {
-            appendActivity(title: module.title, detail: localized("No tasks are enabled in this module right now.", "Er zijn op deze pagina nu geen taken ingeschakeld."), isError: true)
-            return
-        }
 
         closeReview()
         closeAbout()
@@ -363,7 +353,37 @@ final class AppViewModel: ObservableObject {
         isShowingDeveloperPanel = false
         #endif
 
+        selectedModuleID = .smartCare
+
         Task {
+            await scanCurrentModule()
+            let module = MaintenanceCatalog.module(for: .smartCare)
+            let tasks = MaintenanceCatalog.tasks(for: module.id).filter { enabledTaskIDs.contains($0.id) }
+            guard !tasks.isEmpty else {
+                appendActivity(title: module.title, detail: localized("No tasks are enabled in this module right now.", "Er zijn op deze pagina nu geen taken ingeschakeld."), isError: true)
+                return
+            }
+            await execute(tasks: tasks, runTitle: module.title)
+        }
+    }
+
+    func runModule(_ module: MaintenanceModule) {
+        guard !isRunning else { return }
+
+        closeReview()
+        closeAbout()
+        #if DEVELOPER_BUILD
+        isShowingDeveloperPanel = false
+        #endif
+        selectedModuleID = module.id
+
+        Task {
+            await scanCurrentModule()
+            let tasks = MaintenanceCatalog.tasks(for: module.id).filter { enabledTaskIDs.contains($0.id) }
+            guard !tasks.isEmpty else {
+                appendActivity(title: module.title, detail: localized("No tasks are enabled in this module right now.", "Er zijn op deze pagina nu geen taken ingeschakeld."), isError: true)
+                return
+            }
             await execute(tasks: tasks, runTitle: module.title)
         }
     }
@@ -426,7 +446,7 @@ final class AppViewModel: ObservableObject {
 
         #if DEVELOPER_BUILD
         if isPlaceboModeEnabled {
-            let currentVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.1.0"
+            let currentVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? AppBuildFlavor.currentVersion
             let previewVersion = incrementPatchVersion(currentVersion)
             let changelog = developerPreviewChangelog()
             updateState = .updateAvailable(version: previewVersion, notes: changelog, downloadURL: nil)
@@ -441,7 +461,7 @@ final class AppViewModel: ObservableObject {
 
         updateState = .checking
         Task {
-            let currentVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.1.0"
+            let currentVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? AppBuildFlavor.currentVersion
             let result = await updateChecker.check(currentVersion: currentVersion)
             updateState = result
 
@@ -759,7 +779,7 @@ final class AppViewModel: ObservableObject {
     func prepareDeveloperUpdateScene() {
         prepareDeveloperBase()
 
-        let currentVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.1.0"
+        let currentVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? AppBuildFlavor.currentVersion
         let previewVersion = incrementPatchVersion(currentVersion)
         let changelog = developerPreviewChangelog()
 
@@ -1062,7 +1082,7 @@ final class AppViewModel: ObservableObject {
     private func incrementPatchVersion(_ version: String) -> String {
         var parts = version.split(separator: ".").compactMap { Int($0) }
         if parts.isEmpty {
-            return "1.0.1"
+            return "1.0.2"
         }
         if parts.count < 3 {
             parts += Array(repeating: 0, count: 3 - parts.count)
