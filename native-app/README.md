@@ -25,7 +25,9 @@ This folder contains a real macOS SwiftUI front-end for CleanMac Assistant.
 ## Local packaging
 
 - Run `tools/package-macos.sh` to generate both `.app` bundles and both `.dmg` files locally.
+- The packaging script now builds universal macOS binaries by default, so the exported apps support both Apple Silicon and Intel Macs.
 - The script outputs to `native-app/dist/apps/` and `native-app/dist/dmg/`.
+- If you are packaging from a network share, you can override the output location with `DIST_DIR=/some/local/path` to avoid Finder/SMB signing quirks.
 - By default the script uses ad-hoc signing for local testing.
 - For website-ready distribution, rerun it with `SIGN_IDENTITY` and `NOTARY_PROFILE` so the exported DMGs can be signed and notarized.
 
