@@ -3,6 +3,14 @@ import SwiftUI
 
 @MainActor
 final class AppViewModel: ObservableObject {
+    private enum UpdateCheckTrigger {
+        case automatic
+        case manual
+    }
+
+    private let automaticUpdateCheckInterval: TimeInterval = 60 * 60 * 6
+    private let lastAutomaticUpdateCheckKey = "lastAutomaticUpdateCheckDate"
+
     @Published var selectedModuleID: MaintenanceModuleID = .smartCare
     @Published var enabledTaskIDs: Set<MaintenanceTaskID>
     @Published var taskStates: [MaintenanceTaskID: TaskRunState] = [:]
@@ -17,6 +25,8 @@ final class AppViewModel: ObservableObject {
     @Published var lastRunSummary = localized("No maintenance run yet.", "Nog geen onderhoudsrun uitgevoerd.")
     @Published var lastRunReport: RunCompletionReport?
     @Published var updateState: UpdateCheckState = .idle
+    @Published var availableUpdateOffer: AppUpdateOffer?
+    @Published var updateInstallState: AppUpdateInstallState = .idle
     @Published var reviewTaskID: MaintenanceTaskID?
     @Published var reviewSelections: Set<String> = []
     @Published var reviewInputText = ""
@@ -43,6 +53,7 @@ final class AppViewModel: ObservableObject {
     private let executor = MaintenanceCommandExecutor()
     private let scanner = MaintenanceScanner()
     private let updateChecker = UpdateChecker()
+    private let selfUpdater = AppSelfUpdater()
 
     private var savedPromptValues: [MaintenanceTaskID: String] = [:]
     private var savedComponentSelections: [MaintenanceTaskID: Set<String>] = [:]
@@ -61,6 +72,11 @@ final class AppViewModel: ObservableObject {
 
         Task {
             await scanCurrentModule()
+        }
+
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(2.2))
+            performAutomaticUpdateCheckIfNeeded()
         }
     }
 
@@ -158,6 +174,49 @@ final class AppViewModel: ObservableObject {
 
     var shouldShowActivityConsole: Bool {
         activityEntries.count > 1 || lastRunReport != nil
+    }
+
+    var isShowingUpdateExperience: Bool {
+        availableUpdateOffer != nil || updateInstallState.isPresented
+    }
+
+    var updateInstallTitle: String {
+        switch updateInstallState {
+        case .idle:
+            return localized("Update ready", "Update klaar")
+        case .downloading:
+            return localized("Downloading update", "Update downloaden")
+        case .preparing:
+            return localized("Preparing install", "Installatie voorbereiden")
+        case .installing:
+            return localized("Installing update", "Update installeren")
+        case .failed:
+            return localized("Update did not finish", "Update is niet voltooid")
+        }
+    }
+
+    var updateInstallDetail: String {
+        switch updateInstallState {
+        case .idle:
+            return ""
+        case let .downloading(version):
+            return localized(
+                "Version \(version) is downloading now.",
+                "Versie \(version) wordt nu gedownload."
+            )
+        case let .preparing(version):
+            return localized(
+                "Version \(version) is being prepared for installation.",
+                "Versie \(version) wordt voorbereid voor installatie."
+            )
+        case let .installing(version):
+            return localized(
+                "Version \(version) is being installed. The app will relaunch automatically.",
+                "Versie \(version) wordt geïnstalleerd. De app start daarna automatisch opnieuw."
+            )
+        case let .failed(_, message):
+            return message
+        }
     }
 
     var runProgressFraction: Double {
@@ -467,6 +526,29 @@ final class AppViewModel: ObservableObject {
     }
 
     func checkForUpdates() {
+        checkForUpdates(trigger: .manual)
+    }
+
+    func dismissAvailableUpdateOffer() {
+        availableUpdateOffer = nil
+    }
+
+    func dismissUpdateInstallState() {
+        if case .failed = updateInstallState {
+            updateInstallState = .idle
+        }
+    }
+
+    func installAvailableUpdate() {
+        guard let offer = availableUpdateOffer else { return }
+
+        availableUpdateOffer = nil
+        Task {
+            await install(updateOffer: offer)
+        }
+    }
+
+    private func checkForUpdates(trigger: UpdateCheckTrigger) {
         if case .checking = updateState {
             return
         }
@@ -477,6 +559,8 @@ final class AppViewModel: ObservableObject {
             let previewVersion = incrementPatchVersion(currentVersion)
             let changelog = developerPreviewChangelog()
             updateState = .updateAvailable(version: previewVersion, notes: changelog, downloadURL: nil)
+            updateInstallState = .idle
+            availableUpdateOffer = AppUpdateOffer(version: previewVersion, notes: changelog, downloadURL: nil)
             appendActivity(
                 title: localized("Update available", "Update beschikbaar"),
                 detail: localized("Version \(previewVersion) is ready.\n\nChangelog:\n\(changelog)", "Versie \(previewVersion) is klaar.\n\nChangelog:\n\(changelog)"),
@@ -493,31 +577,99 @@ final class AppViewModel: ObservableObject {
             updateState = result
 
             switch result {
-            case let .updateAvailable(version, notes, _):
+            case let .updateAvailable(version, notes, downloadURL):
+                updateInstallState = .idle
+                availableUpdateOffer = AppUpdateOffer(version: version, notes: notes, downloadURL: downloadURL)
                 appendActivity(
                     title: localized("Update available", "Update beschikbaar"),
                     detail: localized("Version \(version) is ready.\n\nChangelog:\n\(notes)", "Versie \(version) is klaar.\n\nChangelog:\n\(notes)"),
                     isError: false
                 )
             case let .upToDate(currentVersion, latestVersion):
-                let detail: String
-                if currentVersion == latestVersion {
-                    detail = localized(
-                        "The EasyComp download folder currently lists version \(latestVersion). This Mac is already up to date.",
-                        "In de EasyComp-downloadmap staat nu versie \(latestVersion). Deze Mac is al bijgewerkt."
-                    )
-                } else {
-                    detail = localized(
-                        "The EasyComp download folder currently lists version \(latestVersion), while this Mac is already on version \(currentVersion).",
-                        "In de EasyComp-downloadmap staat nu versie \(latestVersion), terwijl deze Mac al op versie \(currentVersion) draait."
-                    )
+                updateInstallState = .idle
+                availableUpdateOffer = nil
+                if trigger == .manual {
+                    let detail: String
+                    if currentVersion == latestVersion {
+                        detail = localized(
+                            "The EasyComp download folder currently lists version \(latestVersion). This Mac is already up to date.",
+                            "In de EasyComp-downloadmap staat nu versie \(latestVersion). Deze Mac is al bijgewerkt."
+                        )
+                    } else {
+                        detail = localized(
+                            "The EasyComp download folder currently lists version \(latestVersion), while this Mac is already on version \(currentVersion).",
+                            "In de EasyComp-downloadmap staat nu versie \(latestVersion), terwijl deze Mac al op versie \(currentVersion) draait."
+                        )
+                    }
+                    appendActivity(title: localized("Updates", "Updates"), detail: detail, isError: false)
                 }
-                appendActivity(title: localized("Updates", "Updates"), detail: detail, isError: false)
             case let .failed(message):
-                appendActivity(title: localized("Update check", "Updatecontrole"), detail: message, isError: true)
+                if trigger == .manual {
+                    appendActivity(title: localized("Update check", "Updatecontrole"), detail: message, isError: true)
+                }
             case .idle, .checking:
                 break
             }
+        }
+    }
+
+    private func performAutomaticUpdateCheckIfNeeded() {
+        #if DEVELOPER_BUILD
+        if isPlaceboModeEnabled {
+            return
+        }
+        #endif
+
+        if let lastCheckDate = UserDefaults.standard.object(forKey: lastAutomaticUpdateCheckKey) as? Date,
+           Date().timeIntervalSince(lastCheckDate) < automaticUpdateCheckInterval {
+            return
+        }
+
+        UserDefaults.standard.set(Date(), forKey: lastAutomaticUpdateCheckKey)
+        checkForUpdates(trigger: .automatic)
+    }
+
+    private func install(updateOffer: AppUpdateOffer) async {
+        guard let downloadURL = updateOffer.downloadURL else {
+            let message = localized(
+                "This update does not provide a direct download link yet.",
+                "Deze update heeft nog geen directe downloadlink."
+            )
+            updateInstallState = .failed(version: updateOffer.version, message: message)
+            appendActivity(title: localized("Update install", "Update-installatie"), detail: message, isError: true)
+            return
+        }
+
+        updateInstallState = .downloading(version: updateOffer.version)
+
+        do {
+            let currentAppURL = Bundle.main.bundleURL
+            let preparedInstallation = try await selfUpdater.prepareInstallation(
+                from: downloadURL,
+                version: updateOffer.version,
+                currentAppURL: currentAppURL,
+                expectedAppName: AppBuildFlavor.appName
+            )
+
+            updateInstallState = .preparing(version: updateOffer.version)
+            try? await Task.sleep(for: .milliseconds(350))
+            updateInstallState = .installing(version: updateOffer.version)
+            appendActivity(
+                title: localized("Installing update", "Update installeren"),
+                detail: localized(
+                    "Version \(updateOffer.version) is being installed. The app will relaunch automatically.",
+                    "Versie \(updateOffer.version) wordt geïnstalleerd. De app start daarna automatisch opnieuw."
+                ),
+                isError: false
+            )
+
+            try preparedInstallation.launch()
+            try? await Task.sleep(for: .milliseconds(850))
+            NSApplication.shared.terminate(nil)
+        } catch {
+            let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            updateInstallState = .failed(version: updateOffer.version, message: message)
+            appendActivity(title: localized("Update install", "Update-installatie"), detail: message, isError: true)
         }
     }
 
@@ -832,6 +984,8 @@ final class AppViewModel: ObservableObject {
         taskStates = [:]
         lastRunReport = nil
         updateState = .idle
+        availableUpdateOffer = nil
+        updateInstallState = .idle
         currentTaskID = nil
         completedTaskCount = 0
         totalTaskCount = 0
@@ -877,6 +1031,7 @@ final class AppViewModel: ObservableObject {
         let changelog = developerPreviewChangelog()
 
         updateState = .updateAvailable(version: previewVersion, notes: changelog, downloadURL: nil)
+        availableUpdateOffer = AppUpdateOffer(version: previewVersion, notes: changelog, downloadURL: nil)
         appendActivity(
             title: localized("Update preview", "Updatevoorbeeld"),
             detail: localized(
@@ -1112,12 +1267,12 @@ final class AppViewModel: ObservableObject {
                     TaskScanComponent(id: "demo_cache", title: "General cache", detail: "Temporary cache files kept by apps and macOS in your user account.", reclaimableBytes: 2_180_000_000, itemCount: 1246, selectedByDefault: true, cleanupAction: nil)
                 ]
             )
-        case .chrome, .firefox, .mailAttachments, .safari, .cookies, .imessage, .facetime, .agents, .downloadsReview, .cloudAudit:
+        case .chrome, .firefox, .mailAttachments, .safari, .cookies, .imessage, .facetime, .agents, .downloadsReview, .cloudAudit, .largeOldFiles, .duplicates:
             return placeboReviewState(
                 message: genericMessage,
                 components: sampleComponents(for: task.id)
             )
-        case .scripts, .checkDependencies, .update, .brew, .activityMonitor, .loginItems, .appStoreUpdates, .disk, .largeOldFiles, .duplicates, .ram, .dns, .restart, .logs, .localizations, .malware:
+        case .scripts, .checkDependencies, .update, .brew, .activityMonitor, .loginItems, .appStoreUpdates, .disk, .ram, .dns, .restart, .logs, .localizations, .malware:
             return .ready(
                 TaskScanFinding(
                     message: localized("Preview mode is active. This task is safe to show and will not touch the system.", "Previewmodus is actief. Deze taak is veilig om te tonen en raakt het systeem niet aan."),
@@ -1173,6 +1328,60 @@ final class AppViewModel: ObservableObject {
             ]
         case .downloadsReview:
             return [TaskScanComponent(id: "demo_downloads", title: "Downloads folder", detail: "Files in your Downloads folder that may be safe to review and remove by hand.", reclaimableBytes: 4_200_000_000, itemCount: 143, selectedByDefault: false, cleanupAction: nil)]
+        case .largeOldFiles:
+            return [
+                TaskScanComponent(
+                    id: "demo_large_old_movie",
+                    title: "Client Demo Export.mov",
+                    detail: localized(
+                        "Large file • Last changed 243 days ago\nLocation: ~/Downloads/Client Demo Export.mov\nSelect this file if you want the app to remove it.",
+                        "Groot bestand • 243 dagen geleden voor het laatst gewijzigd\nLocatie: ~/Downloads/Client Demo Export.mov\nSelecteer dit bestand als u wilt dat de app het verwijdert."
+                    ),
+                    reclaimableBytes: 2_840_000_000,
+                    itemCount: 1,
+                    selectedByDefault: false,
+                    cleanupAction: .removePath("/tmp/demo-large-old-movie", requiresAdmin: false)
+                ),
+                TaskScanComponent(
+                    id: "demo_large_old_archive",
+                    title: "Archive-2024.zip",
+                    detail: localized(
+                        "Last opened 198 days ago\nLocation: ~/Desktop/Archive-2024.zip\nSelect this file if you want the app to remove it.",
+                        "198 dagen geleden voor het laatst geopend\nLocatie: ~/Desktop/Archive-2024.zip\nSelecteer dit bestand als u wilt dat de app het verwijdert."
+                    ),
+                    reclaimableBytes: 940_000_000,
+                    itemCount: 1,
+                    selectedByDefault: false,
+                    cleanupAction: .removePath("/tmp/demo-large-old-archive", requiresAdmin: false)
+                )
+            ]
+        case .duplicates:
+            return [
+                TaskScanComponent(
+                    id: "demo_duplicate_invoice",
+                    title: localized("Duplicate copy", "Dubbele kopie") + " • " + "Invoice.pdf",
+                    detail: localized(
+                        "Keep: ~/Documents/Invoices/Invoice.pdf\nRemove this copy: ~/Downloads/Invoice.pdf\nGroup 1",
+                        "Bewaren: ~/Documents/Invoices/Invoice.pdf\nDeze kopie verwijderen: ~/Downloads/Invoice.pdf\nGroep 1"
+                    ),
+                    reclaimableBytes: 18_000_000,
+                    itemCount: 1,
+                    selectedByDefault: true,
+                    cleanupAction: .removePath("/tmp/demo-duplicate-invoice", requiresAdmin: false)
+                ),
+                TaskScanComponent(
+                    id: "demo_duplicate_photo",
+                    title: localized("Duplicate copy", "Dubbele kopie") + " • " + "IMG_1024.HEIC",
+                    detail: localized(
+                        "Keep: ~/Pictures/Trips/IMG_1024.HEIC\nRemove this copy: ~/Desktop/IMG_1024.HEIC\nGroup 2",
+                        "Bewaren: ~/Pictures/Trips/IMG_1024.HEIC\nDeze kopie verwijderen: ~/Desktop/IMG_1024.HEIC\nGroep 2"
+                    ),
+                    reclaimableBytes: 6_400_000,
+                    itemCount: 1,
+                    selectedByDefault: true,
+                    cleanupAction: .removePath("/tmp/demo-duplicate-photo", requiresAdmin: false)
+                )
+            ]
         case .cloudAudit:
             return [
                 TaskScanComponent(id: "demo_icloud", title: "iCloud Drive files", detail: "Files that are stored locally from iCloud Drive.", reclaimableBytes: 12_300_000_000, itemCount: 1204, selectedByDefault: false, cleanupAction: nil),
@@ -1186,7 +1395,7 @@ final class AppViewModel: ObservableObject {
     private func incrementPatchVersion(_ version: String) -> String {
         var parts = version.split(separator: ".").compactMap { Int($0) }
         if parts.isEmpty {
-            return "1.0.3"
+            return "1.0.5"
         }
         if parts.count < 3 {
             parts += Array(repeating: 0, count: 3 - parts.count)
@@ -1210,6 +1419,8 @@ final class AppViewModel: ObservableObject {
         taskStates = [:]
         lastRunReport = nil
         updateState = .idle
+        availableUpdateOffer = nil
+        updateInstallState = .idle
         currentTaskID = nil
         completedTaskCount = 0
         totalTaskCount = 0
@@ -1241,8 +1452,8 @@ final class AppViewModel: ObservableObject {
 
     private func developerPreviewChangelog() -> String {
         localized(
-            "What's new\n• Fixed update checks for the EasyComp download folder\n• Calmer progress flow with a persistent results screen\n• Visible scroll bars and lighter copy throughout the app\n• Subtle completion sounds for steps and finished runs",
-            "Wat is er nieuw\n• Updatecontrole hersteld voor de EasyComp-downloadmap\n• Rustigere voortgangsflow met een blijvend resultaatscherm\n• Zichtbare scrollbalken en compactere teksten in de app\n• Subtiele afrondgeluiden per stap en per run"
+            "What's new\n• Large and stale files can now be reviewed and removed inside the app\n• Duplicate scans now keep one suggested original and let you remove the extra copies\n• File review scenes are clearer for manual cleanup work\n• Developer preview data now mirrors the new file cleanup flow",
+            "Wat is er nieuw\n• Grote en verouderde bestanden kunnen nu in de app worden bekeken en verwijderd\n• Duplicaatscans bewaren nu één voorgesteld origineel en laten u de extra kopieën verwijderen\n• Bestandscontrole is duidelijker gemaakt voor handmatige opschoning\n• Voorbeelddata voor ontwikkelaars volgt nu de nieuwe bestandsopschoonflow"
         )
     }
 

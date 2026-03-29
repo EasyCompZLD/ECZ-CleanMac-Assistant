@@ -211,6 +211,16 @@ struct UpdateChecker {
 
     private func releaseNotes(for version: String) -> String {
         switch normalizedVersion(version) {
+        case "1.0.5":
+            return localized(
+                "What's new\n• Large and stale files can now be reviewed and removed inside the app\n• Duplicate scans now keep one suggested original and let you remove the extra copies\n• File review scenes are clearer for manual cleanup work\n• Developer preview data now mirrors the new file cleanup flow",
+                "Wat is er nieuw\n• Grote en verouderde bestanden kunnen nu in de app worden bekeken en verwijderd\n• Duplicaatscans bewaren nu één voorgesteld origineel en laten u de extra kopieën verwijderen\n• Bestandscontrole is duidelijker gemaakt voor handmatige opschoning\n• Voorbeelddata voor ontwikkelaars volgt nu de nieuwe bestandsopschoonflow"
+            )
+        case "1.0.4":
+            return localized(
+                "What's new\n• New in-app update popup when a newer version is found\n• Downloads and installs DMG releases automatically\n• Relaunches into the new version after the install helper finishes\n• Keeps the manual download option as a fallback",
+                "Wat is er nieuw\n• Nieuwe in-app updatepopup zodra er een nieuwere versie is\n• Downloadt en installeert DMG-releases automatisch\n• Start opnieuw op in de nieuwe versie zodra de updatehulp klaar is\n• Behoudt de handmatige downloadoptie als fallback"
+            )
         case "1.0.3":
             return localized(
                 "What's new\n• Fixed update checks for the EasyComp download folder\n• Calmer progress flow with a persistent results screen\n• Visible scroll bars and lighter card copy\n• Subtle completion sounds for steps and finished runs",

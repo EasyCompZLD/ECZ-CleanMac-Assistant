@@ -645,9 +645,9 @@ private struct ModuleDetailPane: View {
 
     private var overlayIsVisible: Bool {
         #if DEVELOPER_BUILD
-        reviewTask != nil || viewModel.isShowingAbout || viewModel.isRunning || viewModel.lastRunReport != nil || viewModel.isShowingDeveloperPanel
+        reviewTask != nil || viewModel.isShowingAbout || viewModel.isRunning || viewModel.lastRunReport != nil || viewModel.isShowingDeveloperPanel || viewModel.isShowingUpdateExperience
         #else
-        reviewTask != nil || viewModel.isShowingAbout || viewModel.isRunning || viewModel.lastRunReport != nil
+        reviewTask != nil || viewModel.isShowingAbout || viewModel.isRunning || viewModel.lastRunReport != nil || viewModel.isShowingUpdateExperience
         #endif
     }
 
@@ -762,6 +762,16 @@ private struct ModuleDetailPane: View {
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             }
 
+            if viewModel.isShowingUpdateExperience && !viewModel.isRunning {
+                Color.black.opacity(0.24)
+                    .ignoresSafeArea()
+                    .transition(.opacity)
+
+                UpdateExperienceOverlay(module: module)
+                    .padding(24)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+
             #if DEVELOPER_BUILD
             if viewModel.isShowingDeveloperPanel && !viewModel.isRunning {
                 Color.black.opacity(0.22)
@@ -814,6 +824,231 @@ private struct ModuleDetailPane: View {
                 .blur(radius: 52)
                 .offset(x: -220, y: 260)
         }
+    }
+}
+
+private struct UpdateExperienceOverlay: View {
+    @EnvironmentObject private var viewModel: AppViewModel
+    let module: MaintenanceModule
+
+    private var offer: AppUpdateOffer? {
+        viewModel.availableUpdateOffer
+    }
+
+    private var installState: AppUpdateInstallState {
+        viewModel.updateInstallState
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            header
+
+            Rectangle()
+                .fill(Color.white.opacity(0.07))
+                .frame(height: 1)
+
+            if let offer {
+                promptBody(for: offer)
+            } else {
+                installBody
+            }
+        }
+        .frame(maxWidth: 680)
+        .background(
+            RoundedRectangle(cornerRadius: 34, style: .continuous)
+                .fill(
+                    LinearGradient(
+                        colors: [
+                            module.theme.top.opacity(0.96),
+                            module.theme.bottom.opacity(0.94),
+                            Color.black.opacity(0.80)
+                        ],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 34, style: .continuous)
+                        .stroke(Color.white.opacity(0.10), lineWidth: 1)
+                )
+        )
+        .shadow(color: module.theme.accent.opacity(0.24), radius: 40, y: 20)
+    }
+
+    private var header: some View {
+        HStack(alignment: .top, spacing: 16) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 20, style: .continuous)
+                    .fill(module.theme.accent.opacity(0.18))
+                    .frame(width: 68, height: 68)
+
+                Image(systemName: installState.isPresented ? "arrow.down.circle.fill" : "sparkles")
+                    .font(.system(size: 28, weight: .semibold))
+                    .foregroundStyle(AppPalette.textPrimary)
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                if let offer {
+                    Text(localized("New version available", "Nieuwe versie beschikbaar"))
+                        .font(.system(size: 30, weight: .bold, design: .rounded))
+                        .foregroundStyle(AppPalette.textPrimary)
+
+                    Text(localized("Version \(offer.version) is ready to install.", "Versie \(offer.version) staat klaar om te installeren."))
+                        .font(.system(size: 14, weight: .medium))
+                        .foregroundStyle(AppPalette.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    Text(viewModel.updateInstallTitle.appLocalized)
+                        .font(.system(size: 30, weight: .bold, design: .rounded))
+                        .foregroundStyle(AppPalette.textPrimary)
+
+                    Text(viewModel.updateInstallDetail.appLocalized)
+                        .font(.system(size: 14, weight: .medium))
+                        .foregroundStyle(installState.isFailure ? AppPalette.error.opacity(0.96) : AppPalette.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            Spacer(minLength: 12)
+
+            if offer != nil {
+                Button(localized("Later", "Later")) {
+                    viewModel.dismissAvailableUpdateOffer()
+                }
+                .buttonStyle(SecondaryGlassButtonStyle())
+            } else if installState.isFailure {
+                Button(localized("Close", "Sluiten")) {
+                    viewModel.dismissUpdateInstallState()
+                }
+                .buttonStyle(SecondaryGlassButtonStyle())
+            }
+        }
+        .padding(28)
+    }
+
+    private func promptBody(for offer: AppUpdateOffer) -> some View {
+        VStack(alignment: .leading, spacing: 22) {
+            VStack(alignment: .leading, spacing: 12) {
+                Text(localized("What changed", "Wat is er gewijzigd"))
+                    .font(.system(size: 12, weight: .bold, design: .rounded))
+                    .foregroundStyle(AppPalette.textTertiary)
+                    .textCase(.uppercase)
+
+                ScrollView(.vertical, showsIndicators: true) {
+                    Text(offer.notes.appLocalized)
+                        .font(.system(size: 14, weight: .medium))
+                        .foregroundStyle(AppPalette.textSecondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .frame(maxHeight: 210)
+                .appScrollIndicators()
+            }
+
+            HStack(spacing: 14) {
+                Button {
+                    viewModel.installAvailableUpdate()
+                } label: {
+                    Label(localized("Update now", "Nu bijwerken"), systemImage: "arrow.down.circle.fill")
+                        .frame(minWidth: 190)
+                }
+                .buttonStyle(PrimaryAuraButtonStyle())
+
+                if offer.downloadURL != nil {
+                    Button(localized("Open download", "Download openen")) {
+                        viewModel.openUpdateDownload()
+                    }
+                    .buttonStyle(SecondaryGlassButtonStyle())
+                }
+            }
+        }
+        .padding(28)
+    }
+
+    private var installBody: some View {
+        VStack(alignment: .leading, spacing: 22) {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    Text(localized("Update progress", "Updatevoortgang"))
+                        .font(.system(size: 12, weight: .bold, design: .rounded))
+                        .foregroundStyle(AppPalette.textTertiary)
+                        .textCase(.uppercase)
+
+                    Spacer()
+
+                    if let version = installState.version {
+                        Text(version)
+                            .font(.system(size: 12, weight: .bold, design: .rounded))
+                            .foregroundStyle(AppPalette.textPrimary)
+                    }
+                }
+
+                UpdateProgressBar(progress: installState.progressValue, tint: installState.isFailure ? AppPalette.error : module.theme.accent)
+
+                Text(viewModel.updateInstallDetail.appLocalized)
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundStyle(installState.isFailure ? AppPalette.error.opacity(0.96) : AppPalette.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if installState.isFailure {
+                HStack(spacing: 14) {
+                    Button(localized("Try again", "Opnieuw proberen")) {
+                        viewModel.dismissUpdateInstallState()
+                        if viewModel.availableUpdateOffer != nil {
+                            viewModel.installAvailableUpdate()
+                        } else {
+                            viewModel.checkForUpdates()
+                        }
+                    }
+                    .buttonStyle(PrimaryAuraButtonStyle())
+
+                    Button(localized("Open download", "Download openen")) {
+                        viewModel.openUpdateDownload()
+                    }
+                    .buttonStyle(SecondaryGlassButtonStyle())
+                }
+            }
+        }
+        .padding(28)
+    }
+}
+
+private struct UpdateProgressBar: View {
+    let progress: Double
+    let tint: Color
+
+    var body: some View {
+        GeometryReader { proxy in
+            let width = max(proxy.size.width * max(0.04, min(progress, 1.0)), 16)
+
+            ZStack(alignment: .leading) {
+                Capsule()
+                    .fill(Color.white.opacity(0.08))
+
+                Capsule()
+                    .fill(
+                        LinearGradient(
+                            colors: [
+                                tint.opacity(0.86),
+                                AppPalette.iceBlue.opacity(0.96)
+                            ],
+                            startPoint: .leading,
+                            endPoint: .trailing
+                        )
+                    )
+                    .frame(width: width)
+                    .overlay(
+                        Capsule()
+                            .fill(Color.white.opacity(0.20))
+                            .frame(width: max(34, width * 0.28))
+                            .blur(radius: 8)
+                            .padding(.leading, max(0, width - max(34, width * 0.28) - 8)),
+                        alignment: .leading
+                    )
+            }
+        }
+        .frame(height: 16)
     }
 }
 
@@ -2331,8 +2566,8 @@ private struct AboutWorkspace: View {
                     aboutCard(
                         title: localized("Changelog", "Changelog"),
                         body: localized(
-                            "Version 1.0.3 improves the release experience with more reliable update checks for the EasyComp download folder, a calmer progress flow, a persistent results screen, visible scroll bars, lighter interface copy, and subtle completion sounds.",
-                            "Versie 1.0.3 verbetert de release-ervaring met betrouwbaardere updatecontrole voor de EasyComp-downloadmap, een rustigere voortgangsflow, een blijvend resultaatscherm, zichtbare scrollbalken, compactere teksten en subtiele afrondgeluiden."
+                            "Version 1.0.5 adds real in-app cleanup for large or stale files, duplicate review that keeps one suggested original per group, and a clearer file cleanup flow for manual maintenance work.",
+                            "Versie 1.0.5 voegt echte in-app opschoning toe voor grote of verouderde bestanden, duplicaatcontrole die per groep één voorgesteld origineel bewaart en een duidelijkere bestandsopschoonflow voor handmatig onderhoud."
                         )
                     )
                     aboutCard(
@@ -2771,10 +3006,10 @@ private func componentActionText(_ component: TaskScanComponent) -> String {
     switch component.cleanupAction {
     case .none:
         return localized("This part is shown for review only, so nothing is deleted until you open it yourself.", "Dit onderdeel wordt alleen ter controle getoond, dus er wordt niets verwijderd totdat u het zelf opent.")
-    case let .removePath(path, _):
-        return localized("Will remove the local files at \(path).", "Verwijdert de lokale bestanden op \(path).")
+    case .removePath:
+        return localized("Will remove this selected file or data set from your Mac.", "Verwijdert dit geselecteerde bestand of deze dataset van uw Mac.")
     case let .removePaths(paths, _):
-        return localized("Will remove \(paths.count) local file groups from this part.", "Verwijdert \(paths.count) lokale bestandsgroepen uit dit onderdeel.")
+        return localized("Will remove \(paths.count) selected file items from this part.", "Verwijdert \(paths.count) geselecteerde bestandsitems uit dit onderdeel.")
     case let .removeDirectoryContents(path, _):
         return localized("Will remove accessible items inside \(path) and skip protected ones safely.", "Verwijdert toegankelijke onderdelen in \(path) en slaat beschermde onderdelen veilig over.")
     case .shell:

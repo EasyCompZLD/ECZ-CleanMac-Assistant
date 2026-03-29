@@ -30,6 +30,15 @@ struct TaskScanFinding: Equatable {
     let components: [TaskScanComponent]
 }
 
+private struct FileReviewCandidate {
+    let url: URL
+    let size: Int64
+    let modificationDate: Date?
+    let accessDate: Date?
+    let isLarge: Bool
+    let isStale: Bool
+}
+
 enum TaskScanState: Equatable {
     case idle
     case scanning
@@ -38,6 +47,10 @@ enum TaskScanState: Equatable {
 }
 
 actor MaintenanceScanner {
+    private let largeFileThresholdBytes: Int64 = 500 * 1_024 * 1_024
+    private let staleFileAgeInDays = 180
+    private let maxLargeOldReviewItems = 120
+    private let maxDuplicateReviewItems = 120
     private let fileManager = FileManager.default
     private let byteFormatter: ByteCountFormatter = {
         let formatter = ByteCountFormatter()
@@ -309,23 +322,9 @@ actor MaintenanceScanner {
                 )
             )
         case .largeOldFiles:
-            return .ready(
-                TaskScanFinding(
-                    message: "This shows a read-only report of large and older files in Desktop, Documents, and Downloads.",
-                    reclaimableBytes: nil,
-                    itemCount: nil,
-                    components: []
-                )
-            )
+            return largeOldFilesReview()
         case .duplicates:
-            return .ready(
-                TaskScanFinding(
-                    message: "This lists duplicate file candidates first and does not remove anything by itself.",
-                    reclaimableBytes: nil,
-                    itemCount: nil,
-                    components: []
-                )
-            )
+            return duplicateFilesReview()
         case .checkDependencies:
             return .ready(
                 TaskScanFinding(
@@ -378,8 +377,8 @@ actor MaintenanceScanner {
     private func launchAgentsReview() -> TaskScanState {
         let folder = home("Library/LaunchAgents")
         guard fileManager.fileExists(atPath: folder.path) else {
-            return .ready(TaskScanFinding(message: "No LaunchAgents were found in your user Library.", reclaimableBytes: 0, itemCount: 0, components: []))
-        }
+        return .ready(TaskScanFinding(message: "No LaunchAgents were found in your user Library.", reclaimableBytes: 0, itemCount: 0, components: []))
+    }
 
         let urls = (try? fileManager.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.fileSizeKey], options: [.skipsHiddenFiles])) ?? []
         let components = urls.map { url in
@@ -395,6 +394,162 @@ actor MaintenanceScanner {
         }
 
         return reviewState(components: components, emptyMessage: "No LaunchAgents were found in your user Library.")
+    }
+
+    private func largeOldFilesReview() -> TaskScanState {
+        let cutoffDate = Calendar.current.date(byAdding: .day, value: -staleFileAgeInDays, to: Date()) ?? Date.distantPast
+        let candidates = reviewRootDirectories().flatMap { collectLargeOldCandidates(in: $0, cutoffDate: cutoffDate) }
+
+        guard !candidates.isEmpty else {
+            return .ready(
+                TaskScanFinding(
+                    message: localized(
+                        "No large or stale files were found in Desktop, Documents, or Downloads right now.",
+                        "Er zijn op dit moment geen grote of verouderde bestanden gevonden in Bureaublad, Documenten of Downloads."
+                    ),
+                    reclaimableBytes: 0,
+                    itemCount: 0,
+                    components: []
+                )
+            )
+        }
+
+        let sortedCandidates = candidates.sorted(by: isPreferredLargeOldCandidate(_:_:))
+        let visibleCandidates = Array(sortedCandidates.prefix(maxLargeOldReviewItems))
+        let components = visibleCandidates.map(largeOldFileComponent(for:))
+        let totalBytes = components.reduce(Int64(0)) { $0 + ($1.reclaimableBytes ?? 0) }
+
+        let message: String
+        if candidates.count > visibleCandidates.count {
+            message = localized(
+                "Review the biggest or stalest \(visibleCandidates.count) files below and choose exactly what should be removed.",
+                "Bekijk hieronder de grootste of meest verouderde \(visibleCandidates.count) bestanden en kies precies wat mag worden verwijderd."
+            )
+        } else {
+            message = localized(
+                "Review the files below and choose exactly which large or stale items should be removed.",
+                "Bekijk hieronder de bestanden en kies precies welke grote of verouderde onderdelen mogen worden verwijderd."
+            )
+        }
+
+        return .ready(
+            TaskScanFinding(
+                message: message,
+                reclaimableBytes: totalBytes,
+                itemCount: components.count,
+                components: components
+            )
+        )
+    }
+
+    private func duplicateFilesReview() -> TaskScanState {
+        guard let jdupesPath = resolveCommandPath("jdupes") else {
+            return .unavailable(
+                localized(
+                    "jdupes is not installed yet. Open Prepare Tools first, then scan duplicates again.",
+                    "jdupes is nog niet geïnstalleerd. Open eerst Hulpmiddelen voorbereiden en scan daarna opnieuw op duplicaten."
+                )
+            )
+        }
+
+        let roots = reviewRootDirectories()
+        guard !roots.isEmpty else {
+            return .ready(
+                TaskScanFinding(
+                    message: localized(
+                        "The Desktop, Documents, and Downloads folders are not available for duplicate review right now.",
+                        "De mappen Bureaublad, Documenten en Downloads zijn nu niet beschikbaar voor duplicaatcontrole."
+                    ),
+                    reclaimableBytes: 0,
+                    itemCount: 0,
+                    components: []
+                )
+            )
+        }
+
+        let processOutput = runProcess(executable: jdupesPath, arguments: ["-r"] + roots.map(\.path))
+        let duplicateGroups = parseDuplicateGroups(from: processOutput.stdout)
+
+        guard !duplicateGroups.isEmpty else {
+            return .ready(
+                TaskScanFinding(
+                    message: localized(
+                        "No duplicate file groups were found in Desktop, Documents, or Downloads.",
+                        "Er zijn geen groepen met dubbele bestanden gevonden in Bureaublad, Documenten of Downloads."
+                    ),
+                    reclaimableBytes: 0,
+                    itemCount: 0,
+                    components: []
+                )
+            )
+        }
+
+        var components: [TaskScanComponent] = []
+
+        for (groupIndex, group) in duplicateGroups.enumerated() {
+            let urls = group.map { URL(fileURLWithPath: $0) }.filter { fileManager.fileExists(atPath: $0.path) }
+            guard urls.count > 1 else { continue }
+
+            let keeper = preferredDuplicateKeeper(in: urls)
+            let removableCopies = urls.filter { $0 != keeper }
+
+            for removableCopy in removableCopies {
+                components.append(
+                    TaskScanComponent(
+                        id: "duplicate_copy_\(stableIdentifier(for: removableCopy.path))",
+                        title: localized("Duplicate copy", "Dubbele kopie") + " • " + removableCopy.lastPathComponent,
+                        detail: localized(
+                            "Keep: \(displayPath(for: keeper))\nRemove this copy: \(displayPath(for: removableCopy))\nGroup \(groupIndex + 1)",
+                            "Bewaren: \(displayPath(for: keeper))\nDeze kopie verwijderen: \(displayPath(for: removableCopy))\nGroep \(groupIndex + 1)"
+                        ),
+                        reclaimableBytes: fileSize(for: removableCopy),
+                        itemCount: 1,
+                        selectedByDefault: true,
+                        cleanupAction: .removePath(removableCopy.path, requiresAdmin: false)
+                    )
+                )
+            }
+        }
+
+        guard !components.isEmpty else {
+            return .ready(
+                TaskScanFinding(
+                    message: localized(
+                        "No removable duplicate copies were found after reviewing the duplicate groups.",
+                        "Er zijn geen verwijderbare dubbele kopieën gevonden na het controleren van de duplicaatgroepen."
+                    ),
+                    reclaimableBytes: 0,
+                    itemCount: 0,
+                    components: []
+                )
+            )
+        }
+
+        let visibleComponents = Array(components.prefix(maxDuplicateReviewItems))
+        let totalBytes = visibleComponents.reduce(Int64(0)) { $0 + ($1.reclaimableBytes ?? 0) }
+        let duplicateGroupCount = duplicateGroups.count
+        let message: String
+
+        if components.count > visibleComponents.count {
+            message = localized(
+                "We found removable duplicate copies across \(duplicateGroupCount) group(s). One suggested original is kept in each group. Showing the first \(visibleComponents.count) removable copies here.",
+                "We hebben verwijderbare dubbele kopieën gevonden in \(duplicateGroupCount) groep(en). In elke groep blijft één voorgesteld origineel bewaard. Hier worden de eerste \(visibleComponents.count) verwijderbare kopieën getoond."
+            )
+        } else {
+            message = localized(
+                "We found removable duplicate copies across \(duplicateGroupCount) group(s). One suggested original is kept in each group.",
+                "We hebben verwijderbare dubbele kopieën gevonden in \(duplicateGroupCount) groep(en). In elke groep blijft één voorgesteld origineel bewaard."
+            )
+        }
+
+        return .ready(
+            TaskScanFinding(
+                message: message,
+                reclaimableBytes: totalBytes,
+                itemCount: visibleComponents.count,
+                components: visibleComponents
+            )
+        )
     }
 
     private func directoryComponent(id: String, title: String, detail: String, path: URL, selectedByDefault: Bool, cleanupAction: CleanupAction?) -> TaskScanComponent {
@@ -485,8 +640,220 @@ actor MaintenanceScanner {
         fileManager.homeDirectoryForCurrentUser.appendingPathComponent(relativePath)
     }
 
+    private func reviewRootDirectories() -> [URL] {
+        ["Desktop", "Documents", "Downloads"]
+            .map(home)
+            .filter { fileManager.fileExists(atPath: $0.path) }
+    }
+
     private func shellQuote(_ raw: String) -> String {
         "'" + raw.replacingOccurrences(of: "'", with: "'\"'\"'") + "'"
+    }
+
+    private func collectLargeOldCandidates(in rootURL: URL, cutoffDate: Date) -> [FileReviewCandidate] {
+        guard let enumerator = fileManager.enumerator(
+            at: rootURL,
+            includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey, .contentAccessDateKey],
+            options: [.skipsHiddenFiles],
+            errorHandler: { _, _ in true }
+        ) else {
+            return []
+        }
+
+        var candidates: [FileReviewCandidate] = []
+
+        for case let fileURL as URL in enumerator {
+            guard let values = try? fileURL.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey, .contentAccessDateKey]),
+                  values.isRegularFile == true
+            else {
+                continue
+            }
+
+            let fileSize = Int64(values.fileSize ?? 0)
+            let modificationDate = values.contentModificationDate
+            let accessDate = values.contentAccessDate
+            let referenceDate = accessDate ?? modificationDate ?? .distantFuture
+            let isLarge = fileSize >= largeFileThresholdBytes
+            let isStale = referenceDate <= cutoffDate
+
+            guard isLarge || isStale else { continue }
+
+            candidates.append(
+                FileReviewCandidate(
+                    url: fileURL,
+                    size: fileSize,
+                    modificationDate: modificationDate,
+                    accessDate: accessDate,
+                    isLarge: isLarge,
+                    isStale: isStale
+                )
+            )
+        }
+
+        return candidates
+    }
+
+    private func isPreferredLargeOldCandidate(_ lhs: FileReviewCandidate, _ rhs: FileReviewCandidate) -> Bool {
+        let leftPriority = (lhs.isLarge ? 2 : 0) + (lhs.isStale ? 1 : 0)
+        let rightPriority = (rhs.isLarge ? 2 : 0) + (rhs.isStale ? 1 : 0)
+
+        if leftPriority != rightPriority {
+            return leftPriority > rightPriority
+        }
+
+        if lhs.size != rhs.size {
+            return lhs.size > rhs.size
+        }
+
+        let leftDate = lhs.accessDate ?? lhs.modificationDate ?? .distantPast
+        let rightDate = rhs.accessDate ?? rhs.modificationDate ?? .distantPast
+        if leftDate != rightDate {
+            return leftDate < rightDate
+        }
+
+        return lhs.url.path < rhs.url.path
+    }
+
+    private func largeOldFileComponent(for candidate: FileReviewCandidate) -> TaskScanComponent {
+        let stalenessDate = candidate.accessDate ?? candidate.modificationDate
+        var badges: [String] = []
+
+        if candidate.isLarge {
+            badges.append(localized("Large file", "Groot bestand"))
+        }
+
+        if candidate.isStale, let stalenessDate {
+            let dayCount = max(1, Calendar.current.dateComponents([.day], from: stalenessDate, to: Date()).day ?? staleFileAgeInDays)
+            if candidate.accessDate != nil {
+                badges.append(localized("Last opened \(dayCount) days ago", "\(dayCount) dagen geleden voor het laatst geopend"))
+            } else {
+                badges.append(localized("Last changed \(dayCount) days ago", "\(dayCount) dagen geleden voor het laatst gewijzigd"))
+            }
+        }
+
+        let detail = [
+            badges.joined(separator: " • "),
+            localized("Location: \(displayPath(for: candidate.url))", "Locatie: \(displayPath(for: candidate.url))"),
+            localized("Select this file if you want the app to remove it.", "Selecteer dit bestand als u wilt dat de app het verwijdert.")
+        ]
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n")
+
+        return TaskScanComponent(
+            id: "large_old_file_\(stableIdentifier(for: candidate.url.path))",
+            title: candidate.url.lastPathComponent,
+            detail: detail,
+            reclaimableBytes: candidate.size,
+            itemCount: 1,
+            selectedByDefault: false,
+            cleanupAction: .removePath(candidate.url.path, requiresAdmin: false)
+        )
+    }
+
+    private func preferredDuplicateKeeper(in urls: [URL]) -> URL {
+        urls.sorted(by: isPreferredDuplicateKeeper(_:_:)).first ?? urls[0]
+    }
+
+    private func isPreferredDuplicateKeeper(_ lhs: URL, _ rhs: URL) -> Bool {
+        let leftRootPriority = reviewRootPriority(for: lhs)
+        let rightRootPriority = reviewRootPriority(for: rhs)
+        if leftRootPriority != rightRootPriority {
+            return leftRootPriority < rightRootPriority
+        }
+
+        let leftDate = modificationDate(for: lhs) ?? .distantPast
+        let rightDate = modificationDate(for: rhs) ?? .distantPast
+        if leftDate != rightDate {
+            return leftDate > rightDate
+        }
+
+        if lhs.lastPathComponent.count != rhs.lastPathComponent.count {
+            return lhs.lastPathComponent.count < rhs.lastPathComponent.count
+        }
+
+        return lhs.path.count < rhs.path.count
+    }
+
+    private func reviewRootPriority(for url: URL) -> Int {
+        let path = url.path
+        let homePath = fileManager.homeDirectoryForCurrentUser.path
+
+        if path.hasPrefix(homePath + "/Documents/") {
+            return 0
+        }
+        if path.hasPrefix(homePath + "/Desktop/") {
+            return 1
+        }
+        if path.hasPrefix(homePath + "/Downloads/") {
+            return 2
+        }
+        return 3
+    }
+
+    private func modificationDate(for url: URL) -> Date? {
+        try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
+    }
+
+    private func parseDuplicateGroups(from output: String) -> [[String]] {
+        output
+            .components(separatedBy: "\n\n")
+            .map { group in
+                group
+                    .split(whereSeparator: \.isNewline)
+                    .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+                    .filter { !$0.isEmpty && fileManager.fileExists(atPath: $0) }
+            }
+            .filter { $0.count > 1 }
+    }
+
+    private func resolveCommandPath(_ toolName: String) -> String? {
+        let output = runProcess(executable: "/bin/zsh", arguments: ["-lc", "command -v \(shellQuote(toolName))"])
+        guard output.exitCode == 0 else { return nil }
+        let path = output.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        return path.isEmpty ? nil : path
+    }
+
+    private func runProcess(executable: String, arguments: [String]) -> (exitCode: Int32, stdout: String, stderr: String) {
+        let process = Process()
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            return (1, "", error.localizedDescription)
+        }
+
+        let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+        let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+        return (
+            process.terminationStatus,
+            String(decoding: stdoutData, as: UTF8.self),
+            String(decoding: stderrData, as: UTF8.self)
+        )
+    }
+
+    private func displayPath(for url: URL) -> String {
+        let homePath = fileManager.homeDirectoryForCurrentUser.path
+        if url.path.hasPrefix(homePath) {
+            return "~" + url.path.dropFirst(homePath.count)
+        }
+        return url.path
+    }
+
+    private func stableIdentifier(for raw: String) -> String {
+        var hash: UInt64 = 1_469_598_103_934_665_603
+        for byte in raw.utf8 {
+            hash ^= UInt64(byte)
+            hash = hash &* 1_099_511_628_211
+        }
+        return String(hash, radix: 16)
     }
 
     private func directoryStats(for rootURL: URL) -> (bytes: Int64, files: Int) {
