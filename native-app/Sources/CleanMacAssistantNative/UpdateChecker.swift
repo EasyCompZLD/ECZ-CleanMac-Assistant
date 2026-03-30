@@ -196,12 +196,12 @@ struct UpdateChecker {
     }
 
     private func extractVersion(from text: String) -> String? {
-        let pattern = #"\b\d+(?:\.\d+){1,3}\b"#
+        let pattern = #"(?i)(?:^|[^0-9A-Za-z])v?(\d+(?:\.\d+){1,3})(?![0-9A-Za-z])"#
         guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
         let range = NSRange(text.startIndex..<text.endIndex, in: text)
 
         guard let match = regex.firstMatch(in: text, range: range),
-              let versionRange = Range(match.range(at: 0), in: text)
+              let versionRange = Range(match.range(at: 1), in: text)
         else {
             return nil
         }
@@ -211,6 +211,16 @@ struct UpdateChecker {
 
     private func releaseNotes(for version: String) -> String {
         switch normalizedVersion(version) {
+        case "1.0.12":
+            return localized(
+                "What's new\n• Update detection now understands release file names such as V1.0.12 instead of missing the version when it is prefixed with a V\n• Automatic update checks now run on app launch without waiting for the previous six-hour cooldown\n• A newly uploaded release should now surface as the in-app update popup more reliably\n• Release notes and packaging were refreshed for the updater reliability pass",
+                "Wat is er nieuw\n• Updatedetectie begrijpt nu bestandsnamen zoals V1.0.12 in plaats van de versie te missen zodra er een V voor staat\n• Automatische updatecontroles draaien nu bij het opstarten van de app zonder te wachten op de vorige zes-uurs cooldown\n• Een nieuw geuploade release hoort nu betrouwbaarder als updatepopup in de app te verschijnen\n• Release-notes en packaging zijn vernieuwd voor deze updater-betrouwbaarheidspass"
+            )
+        case "1.0.11":
+            return localized(
+                "What's new\n• Malware Scan now prepares its own local ClamAV signatures database in your user Library instead of relying on an empty Homebrew default folder\n• The app refreshes ClamAV signatures automatically when needed before starting a scan\n• Intel and Apple Silicon Macs now use the same calmer ClamAV setup flow\n• Protection copy was refreshed so the first-run database download is explained more clearly",
+                "Wat is er nieuw\n• Malwarescan bereidt nu zijn eigen lokale ClamAV-signaturedatabase voor in uw gebruikersbibliotheek in plaats van te vertrouwen op een lege standaardmap van Homebrew\n• De app ververst ClamAV-signatures nu automatisch wanneer dat nodig is voordat een scan start\n• Intel- en Apple Silicon-Macs gebruiken nu dezelfde rustigere ClamAV-opstartflow\n• De tekst in Bescherming is vernieuwd zodat de eerste database-download duidelijker wordt uitgelegd"
+            )
         case "1.0.10":
             return localized(
                 "What's new\n• Files now asks you to choose scan folders once instead of tripping repeated Desktop, Documents, and Downloads permission prompts\n• Large-file, duplicate, and installer reviews now stay inside the folders you explicitly connected\n• The Files page includes a clearer folder-access panel so the scan scope stays understandable\n• The release metadata was refreshed for the calmer file-access flow",

@@ -2919,8 +2919,8 @@ private struct AboutWorkspace: View {
                     aboutCard(
                         title: localized("Changelog", "Changelog"),
                         body: localized(
-                            "Version 1.0.10 adds a calmer folder-access flow to Files, so large-file, duplicate, and installer scans no longer trigger repeated macOS prompts for every location.",
-                            "Versie 1.0.10 voegt een rustigere maptoegangsflow toe aan Bestanden, zodat scans op grote bestanden, duplicaten en installers niet meer voor elke locatie opnieuw macOS-meldingen oproepen."
+                            "Version 1.0.12 improves updater reliability by recognizing release files such as V1.0.12 correctly and checking for updates again on launch without waiting for the old cooldown.",
+                            "Versie 1.0.12 verbetert de betrouwbaarheid van de updater door releasebestanden zoals V1.0.12 correct te herkennen en bij het opstarten opnieuw op updates te controleren zonder op de oude wachttijd te wachten."
                         )
                     )
                     aboutCard(

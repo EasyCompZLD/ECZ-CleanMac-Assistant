@@ -30,9 +30,6 @@ final class AppViewModel: ObservableObject {
         case manual
     }
 
-    private let automaticUpdateCheckInterval: TimeInterval = 60 * 60 * 6
-    private let lastAutomaticUpdateCheckKey = "lastAutomaticUpdateCheckDate"
-
     @Published var selectedModuleID: MaintenanceModuleID = .smartCare
     @Published var enabledTaskIDs: Set<MaintenanceTaskID>
     @Published var taskStates: [MaintenanceTaskID: TaskRunState] = [:]
@@ -782,13 +779,6 @@ final class AppViewModel: ObservableObject {
             return
         }
         #endif
-
-        if let lastCheckDate = UserDefaults.standard.object(forKey: lastAutomaticUpdateCheckKey) as? Date,
-           Date().timeIntervalSince(lastCheckDate) < automaticUpdateCheckInterval {
-            return
-        }
-
-        UserDefaults.standard.set(Date(), forKey: lastAutomaticUpdateCheckKey)
         checkForUpdates(trigger: .automatic)
     }
 
@@ -1711,7 +1701,7 @@ final class AppViewModel: ObservableObject {
     private func incrementPatchVersion(_ version: String) -> String {
         var parts = version.split(separator: ".").compactMap { Int($0) }
         if parts.isEmpty {
-            return "1.0.10"
+            return "1.0.12"
         }
         if parts.count < 3 {
             parts += Array(repeating: 0, count: 3 - parts.count)
@@ -1768,8 +1758,8 @@ final class AppViewModel: ObservableObject {
 
     private func developerPreviewChangelog() -> String {
         localized(
-            "What's new\n• Files now uses a chosen-folder access flow so Desktop, Documents, and Downloads scans stop triggering repeated macOS permission prompts\n• You can connect scan folders once from the Files page and clear them later when needed\n• Large-file, duplicate, and installer scans now stay inside the folders you explicitly approved\n• Release notes and packaging were refreshed for the file-access pass",
-            "Wat is er nieuw\n• Bestanden gebruikt nu een gekozen-maptoegang, zodat scans van Bureaublad, Documenten en Downloads geen herhaalde macOS-toestemmingsmeldingen meer geven\n• U kunt scanmappen nu één keer koppelen vanuit de Bestanden-pagina en later weer wissen wanneer nodig\n• Scans op grote bestanden, duplicaten en installers blijven nu binnen de mappen die u zelf expliciet hebt toegestaan\n• Release-notes en packaging zijn vernieuwd voor deze bestands-toegangspass"
+            "What's new\n• Update detection now recognizes release file names such as V1.0.12 and compares the full x.x.x version correctly\n• Automatic update checks now run on launch without the old six-hour wait, so the update popup can surface immediately\n• Newly uploaded releases in the EasyComp download folder should now appear more reliably as in-app update prompts\n• Release notes and packaging were refreshed for the updater reliability pass",
+            "Wat is er nieuw\n• Updatedetectie herkent nu releasebestandsnamen zoals V1.0.12 en vergelijkt de volledige x.x.x-versie correct\n• Automatische updatecontroles draaien nu meteen bij het opstarten zonder de oude wachttijd van zes uur, zodat de updatepopup direct kan verschijnen\n• Nieuw geuploade releases in de EasyComp-downloadmap horen nu betrouwbaarder als in-app updateprompt te verschijnen\n• Release-notes en packaging zijn vernieuwd voor deze updater-betrouwbaarheidspass"
         )
     }
 

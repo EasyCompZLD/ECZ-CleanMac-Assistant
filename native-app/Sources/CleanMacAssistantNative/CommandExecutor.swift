@@ -27,6 +27,16 @@ private struct ProcessOutput {
     }
 }
 
+private struct ClamDatabasePreparation {
+    let databaseDirectory: String
+    let output: String
+}
+
+private enum ClamDatabasePreparationResult {
+    case ready(ClamDatabasePreparation)
+    case failed(CommandExecutionResult)
+}
+
 private enum ComponentCleanupStatus {
     case success(String)
     case warning(String)
@@ -74,6 +84,7 @@ private enum ProtectedResourceArea {
 actor MaintenanceCommandExecutor {
     private let fileManager = FileManager.default
     private let shellBootstrap = "PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin; export PATH; "
+    private let clamDatabaseRefreshInterval: TimeInterval = 60 * 60 * 24 * 3
     private let byteFormatter: ByteCountFormatter = {
         let formatter = ByteCountFormatter()
         formatter.allowedUnits = [.useKB, .useMB, .useGB, .useTB]
@@ -246,8 +257,25 @@ actor MaintenanceCommandExecutor {
             guard let clamscanPath = await resolveCommandPath("clamscan") else {
                 return CommandExecutionResult(success: false, summary: localized("ClamAV is still unavailable.", "ClamAV is nog steeds niet beschikbaar."), output: "")
             }
-            let result = await runShell("\(shellQuote(clamscanPath)) -r / --verbose", requiresAdmin: true)
-            return translate(result, success: localized("Malware scan finished.", "Malwarescan is afgerond."), failure: localized("Malware scan failed.", "Malwarescan is mislukt."))
+            switch await prepareClamDatabase() {
+            case let .failed(result):
+                return result
+            case let .ready(preparation):
+                let result = await runShell(
+                    "\(shellQuote(clamscanPath)) --database=\(shellQuote(preparation.databaseDirectory)) -r / --verbose",
+                    requiresAdmin: true
+                )
+                let translated = translate(
+                    result,
+                    success: localized("Malware scan finished.", "Malwarescan is afgerond."),
+                    failure: localized("Malware scan failed.", "Malwarescan is mislukt.")
+                )
+                let combinedOutput = [preparation.output, translated.output]
+                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                    .filter { !$0.isEmpty }
+                    .joined(separator: "\n\n")
+                return CommandExecutionResult(success: translated.success, summary: translated.summary, output: combinedOutput)
+            }
 
         default:
             let result = await runShell(command, requiresAdmin: requiresAdmin)
@@ -420,6 +448,156 @@ actor MaintenanceCommandExecutor {
         guard result.isSuccess else { return nil }
         let path = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
         return path.isEmpty ? nil : path
+    }
+
+    private func prepareClamDatabase() async -> ClamDatabasePreparationResult {
+        guard let freshclamPath = await resolveCommandPath("freshclam") else {
+            return .failed(
+                CommandExecutionResult(
+                    success: false,
+                    summary: localized("ClamAV updater is not available.", "De ClamAV-updater is niet beschikbaar."),
+                    output: localized(
+                        "Install or reinstall the Homebrew clamav package so freshclam can download the malware signatures before scanning.",
+                        "Installeer of herinstalleer het Homebrew-pakket clamav zodat freshclam de malwaresignatures kan downloaden voordat er wordt gescand."
+                    )
+                )
+            )
+        }
+
+        let databaseDirectoryURL: URL
+        do {
+            databaseDirectoryURL = try clamDatabaseDirectory()
+            try fileManager.createDirectory(at: databaseDirectoryURL, withIntermediateDirectories: true)
+        } catch {
+            return .failed(
+                CommandExecutionResult(
+                    success: false,
+                    summary: localized("ClamAV signatures could not be prepared.", "De ClamAV-signatures konden niet worden voorbereid."),
+                    output: error.localizedDescription
+                )
+            )
+        }
+
+        let databaseDirectory = databaseDirectoryURL.path
+        let hadDatabaseBeforeRefresh = clamDatabaseExists(in: databaseDirectoryURL)
+        let needsRefresh = !hadDatabaseBeforeRefresh || clamDatabaseNeedsRefresh(in: databaseDirectoryURL)
+        var notes: [String] = [
+            localized(
+                "Using a local ClamAV signature store at \(databaseDirectory).",
+                "Gebruikt een lokale ClamAV-signaturemap op \(databaseDirectory)."
+            )
+        ]
+
+        if needsRefresh {
+            let refresh = await runShell(
+                "\(shellQuote(freshclamPath)) --datadir=\(shellQuote(databaseDirectory))",
+                requiresAdmin: false
+            )
+
+            if refresh.isSuccess {
+                notes.append(
+                    hadDatabaseBeforeRefresh
+                        ? localized("ClamAV signatures were refreshed before scanning.", "ClamAV-signatures zijn vernieuwd voordat de scan begon.")
+                        : localized("ClamAV signatures were downloaded before scanning.", "ClamAV-signatures zijn gedownload voordat de scan begon.")
+                )
+                let refreshOutput = refresh.combined.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !refreshOutput.isEmpty {
+                    notes.append(refreshOutput)
+                }
+            } else if clamDatabaseExists(in: databaseDirectoryURL) {
+                notes.append(
+                    localized(
+                        "ClamAV could not refresh the signatures right now, so the scan continues with the existing local database.",
+                        "ClamAV kon de signatures nu niet verversen, dus de scan gaat verder met de bestaande lokale database."
+                    )
+                )
+                let refreshOutput = refresh.combined.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !refreshOutput.isEmpty {
+                    notes.append(refreshOutput)
+                }
+            } else {
+                let refreshOutput = refresh.combined.trimmingCharacters(in: .whitespacesAndNewlines)
+                return .failed(
+                    CommandExecutionResult(
+                        success: false,
+                        summary: localized("ClamAV has no signatures yet.", "ClamAV heeft nog geen signatures."),
+                        output: localized(
+                            "The malware scanner could not download its virus database. Please check your internet connection and try the scan again.",
+                            "De malwarescanner kon de virusdatabase niet downloaden. Controleer uw internetverbinding en probeer de scan opnieuw."
+                        ) + (refreshOutput.isEmpty ? "" : "\n\n" + refreshOutput)
+                    )
+                )
+            }
+        } else {
+            notes.append(
+                localized(
+                    "The local ClamAV signature database is already available, so the scan can start immediately.",
+                    "De lokale ClamAV-signaturedatabase is al beschikbaar, dus de scan kan meteen starten."
+                )
+            )
+        }
+
+        guard clamDatabaseExists(in: databaseDirectoryURL) else {
+            return .failed(
+                CommandExecutionResult(
+                    success: false,
+                    summary: localized("ClamAV has no signatures yet.", "ClamAV heeft nog geen signatures."),
+                    output: localized(
+                        "No supported ClamAV database files were found after preparation. Try reinstalling clamav with Homebrew and run the scan again.",
+                        "Na de voorbereiding zijn er geen ondersteunde ClamAV-databasebestanden gevonden. Probeer clamav opnieuw te installeren met Homebrew en voer de scan daarna opnieuw uit."
+                    )
+                )
+            )
+        }
+
+        return .ready(
+            ClamDatabasePreparation(
+                databaseDirectory: databaseDirectory,
+                output: notes.joined(separator: "\n")
+            )
+        )
+    }
+
+    private func clamDatabaseDirectory() throws -> URL {
+        let appSupport = try fileManager.url(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: true
+        )
+
+        return appSupport
+            .appendingPathComponent(AppBuildFlavor.appName, isDirectory: true)
+            .appendingPathComponent("ClamAV", isDirectory: true)
+            .appendingPathComponent("database", isDirectory: true)
+    }
+
+    private func clamDatabaseExists(in directory: URL) -> Bool {
+        !clamDatabaseFiles(in: directory).isEmpty
+    }
+
+    private func clamDatabaseNeedsRefresh(in directory: URL) -> Bool {
+        let files = clamDatabaseFiles(in: directory)
+        guard let newestDate = files
+            .compactMap({ try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate })
+            .max()
+        else {
+            return true
+        }
+
+        return Date().timeIntervalSince(newestDate) > clamDatabaseRefreshInterval
+    }
+
+    private func clamDatabaseFiles(in directory: URL) -> [URL] {
+        let contents = (try? fileManager.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        )) ?? []
+
+        return contents.filter { file in
+            ["cvd", "cld", "cud"].contains(file.pathExtension.lowercased())
+        }
     }
 
     private func runShell(_ command: String, requiresAdmin: Bool) async -> ProcessOutput {
