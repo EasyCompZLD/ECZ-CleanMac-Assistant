@@ -1,14 +1,34 @@
 import Foundation
 
+private func emitMaintenanceProgressLine(_ line: String, taskID: MaintenanceTaskID) {
+    NotificationCenter.default.post(
+        name: MaintenanceProgressNotification.name,
+        object: nil,
+        userInfo: [
+            MaintenanceProgressNotification.taskIDKey: taskID.rawValue,
+            MaintenanceProgressNotification.lineKey: line
+        ]
+    )
+}
+
 struct TaskExecutionRequest {
     let input: String?
     let selectedComponents: [TaskScanComponent]
+    let selectedReviewComponents: [TaskScanComponent]
 }
 
 struct CommandExecutionResult {
     let success: Bool
     let summary: String
     let output: String
+    let malwareOutcome: MalwareScanOutcome?
+
+    init(success: Bool, summary: String, output: String, malwareOutcome: MalwareScanOutcome? = nil) {
+        self.success = success
+        self.summary = summary
+        self.output = output
+        self.malwareOutcome = malwareOutcome
+    }
 }
 
 private struct ProcessOutput {
@@ -24,6 +44,78 @@ private struct ProcessOutput {
 
     var isSuccess: Bool {
         exitCode == 0
+    }
+}
+
+private final class StreamingProcessCollector: @unchecked Sendable {
+    private let queue = DispatchQueue(label: "MaintenanceCommandExecutor.streaming")
+    private var stdoutData = Data()
+    private var stderrData = Data()
+    private var stdoutBuffer = Data()
+    private var stderrBuffer = Data()
+
+    func append(_ newData: Data, isStdout: Bool) -> [String] {
+        guard !newData.isEmpty else { return [] }
+
+        return queue.sync {
+            if isStdout {
+                stdoutData.append(newData)
+                stdoutBuffer.append(newData)
+                return Self.extractLines(from: &stdoutBuffer)
+            } else {
+                stderrData.append(newData)
+                stderrBuffer.append(newData)
+                return Self.extractLines(from: &stderrBuffer)
+            }
+        }
+    }
+
+    func flushRemainder(isStdout: Bool) -> [String] {
+        queue.sync {
+            let buffer = isStdout ? stdoutBuffer : stderrBuffer
+            guard !buffer.isEmpty else { return [] }
+
+            let line = String(data: buffer, encoding: .utf8)?
+                .replacingOccurrences(of: "\r", with: "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+
+            if isStdout {
+                stdoutBuffer.removeAll(keepingCapacity: false)
+            } else {
+                stderrBuffer.removeAll(keepingCapacity: false)
+            }
+
+            guard let line, !line.isEmpty else { return [] }
+            return [line]
+        }
+    }
+
+    func outputs() -> (stdout: String, stderr: String) {
+        queue.sync {
+            (
+                String(data: stdoutData, encoding: .utf8) ?? "",
+                String(data: stderrData, encoding: .utf8) ?? ""
+            )
+        }
+    }
+
+    private static func extractLines(from buffer: inout Data) -> [String] {
+        var lines: [String] = []
+
+        while let newlineIndex = buffer.firstIndex(of: 0x0A) {
+            let lineData = buffer.subdata(in: 0..<newlineIndex)
+            buffer.removeSubrange(0...newlineIndex)
+
+            if let line = String(data: lineData, encoding: .utf8)?
+                .replacingOccurrences(of: "\r", with: "")
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+               !line.isEmpty
+            {
+                lines.append(line)
+            }
+        }
+
+        return lines
     }
 }
 
@@ -103,7 +195,7 @@ actor MaintenanceCommandExecutor {
             return await runDependencyCheck()
 
         case let .shell(command, requiresAdmin):
-            return await runMappedShellCommand(command, task: task, requiresAdmin: requiresAdmin)
+            return await runMappedShellCommand(command, task: task, request: request, requiresAdmin: requiresAdmin)
 
         case let .inlineReport(command):
             return await runInlineReport(command, task: task)
@@ -234,7 +326,7 @@ actor MaintenanceCommandExecutor {
         return CommandExecutionResult(success: true, summary: localized("Homebrew, ClamAV, ncdu, and jdupes are ready.", "Homebrew, ClamAV, ncdu en jdupes zijn klaar."), output: notes.joined(separator: "\n"))
     }
 
-    private func runMappedShellCommand(_ command: String, task: MaintenanceTaskDefinition, requiresAdmin: Bool) async -> CommandExecutionResult {
+    private func runMappedShellCommand(_ command: String, task: MaintenanceTaskDefinition, request: TaskExecutionRequest, requiresAdmin: Bool) async -> CommandExecutionResult {
         switch command {
         case "__BREW_UPDATE__":
             guard let brewPath = await resolveCommandPath("brew") else {
@@ -257,24 +349,70 @@ actor MaintenanceCommandExecutor {
             guard let clamscanPath = await resolveCommandPath("clamscan") else {
                 return CommandExecutionResult(success: false, summary: localized("ClamAV is still unavailable.", "ClamAV is nog steeds niet beschikbaar."), output: "")
             }
-            switch await prepareClamDatabase() {
+            switch await prepareClamDatabase(for: task.id) {
             case let .failed(result):
                 return result
             case let .ready(preparation):
-                let result = await runShell(
-                    "\(shellQuote(clamscanPath)) --database=\(shellQuote(preparation.databaseDirectory)) -r / --verbose",
-                    requiresAdmin: true
+                let selectedTargetComponents = request.selectedReviewComponents.filter { $0.role == .scanTarget }
+                let scanTargets = clamScanTargets(from: selectedTargetComponents)
+                guard !scanTargets.isEmpty else {
+                    return CommandExecutionResult(
+                        success: false,
+                        summary: localized("No scan locations are available.", "Er zijn geen scanlocaties beschikbaar."),
+                        output: localized(
+                            "CleanMac Assistant could not find any accessible app or user folders to scan with ClamAV.",
+                            "CleanMac Assistant kon geen toegankelijke app- of gebruikersmappen vinden om met ClamAV te scannen."
+                        )
+                    )
+                }
+
+                emitMaintenanceProgressLine("__ECZ_SCAN_PREPARING_SCOPE__", taskID: task.id)
+                let estimatedFileCount = estimatedClamScanFileCount(in: scanTargets)
+                if estimatedFileCount > 0 {
+                    emitMaintenanceProgressLine("__ECZ_SCAN_TOTAL_FILES__:\(estimatedFileCount)", taskID: task.id)
+                }
+
+                let targetList = scanTargets.map(shellQuote).joined(separator: " ")
+                let result = await runStreamingShell(
+                    "\(shellQuote(clamscanPath)) --database=\(shellQuote(preparation.databaseDirectory)) --recursive --verbose --stdout \(targetList)",
+                    progressTaskID: task.id
                 )
-                let translated = translate(
-                    result,
-                    success: localized("Malware scan finished.", "Malwarescan is afgerond."),
-                    failure: localized("Malware scan failed.", "Malwarescan is mislukt.")
+                let malwareOutcome = parseMalwareScanOutcome(
+                    from: result.combined,
+                    targetTitles: selectedTargetComponents.map { $0.title.appLocalized }
                 )
-                let combinedOutput = [preparation.output, translated.output]
+                let success = result.exitCode == 0 || (result.exitCode == 1 && !malwareOutcome.threats.isEmpty)
+                let summary: String
+                if !success {
+                    summary = localized("Malware scan failed.", "Malwarescan is mislukt.")
+                } else if malwareOutcome.threats.isEmpty {
+                    summary = localized("Malware scan finished. No threats were found.", "Malwarescan is afgerond. Er zijn geen dreigingen gevonden.")
+                } else {
+                    let count = malwareOutcome.threats.count
+                    summary = localized(
+                        "Malware scan finished. \(count) potential threat(s) need your decision.",
+                        "Malwarescan is afgerond. \(count) mogelijke dreiging(en) wachten op uw keuze."
+                    )
+                }
+                let targetTitleSummary = selectedTargetComponents.map { $0.title.appLocalized }
+                let targetSummary: String
+                if targetTitleSummary.isEmpty {
+                    targetSummary = localized(
+                        "Scanning \(scanTargets.count) focused app, launch, and user locations instead of blindly crawling the full disk, so progress can stay visible and the sweep stays relevant.",
+                        "Scant \(scanTargets.count) gerichte app-, opstart- en gebruikerslocaties in plaats van blind de hele schijf af te lopen, zodat de voortgang zichtbaar blijft en de controle relevant blijft."
+                    )
+                } else {
+                    let joinedTitles = targetTitleSummary.joined(separator: ", ")
+                    targetSummary = localized(
+                        "Scanning the areas you selected: \(joinedTitles).",
+                        "Scant alleen de gebieden die u hebt geselecteerd: \(joinedTitles)."
+                    )
+                }
+                let combinedOutput = [preparation.output, targetSummary, condensedClamOutput(result.combined)]
                     .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
                     .filter { !$0.isEmpty }
                     .joined(separator: "\n\n")
-                return CommandExecutionResult(success: translated.success, summary: translated.summary, output: combinedOutput)
+                return CommandExecutionResult(success: success, summary: summary, output: combinedOutput, malwareOutcome: malwareOutcome)
             }
 
         default:
@@ -450,7 +588,7 @@ actor MaintenanceCommandExecutor {
         return path.isEmpty ? nil : path
     }
 
-    private func prepareClamDatabase() async -> ClamDatabasePreparationResult {
+    private func prepareClamDatabase(for taskID: MaintenanceTaskID) async -> ClamDatabasePreparationResult {
         guard let freshclamPath = await resolveCommandPath("freshclam") else {
             return .failed(
                 CommandExecutionResult(
@@ -465,9 +603,11 @@ actor MaintenanceCommandExecutor {
         }
 
         let databaseDirectoryURL: URL
+        let freshclamConfigURL: URL
         do {
             databaseDirectoryURL = try clamDatabaseDirectory()
             try fileManager.createDirectory(at: databaseDirectoryURL, withIntermediateDirectories: true)
+            freshclamConfigURL = try ensureFreshclamConfig(for: databaseDirectoryURL)
         } catch {
             return .failed(
                 CommandExecutionResult(
@@ -485,13 +625,17 @@ actor MaintenanceCommandExecutor {
             localized(
                 "Using a local ClamAV signature store at \(databaseDirectory).",
                 "Gebruikt een lokale ClamAV-signaturemap op \(databaseDirectory)."
+            ),
+            localized(
+                "Using an app-local freshclam configuration so Homebrew's missing default config does not block signature updates.",
+                "Gebruikt een app-lokale freshclam-configuratie zodat de ontbrekende standaardconfig van Homebrew updates van signatures niet blokkeert."
             )
         ]
 
         if needsRefresh {
-            let refresh = await runShell(
-                "\(shellQuote(freshclamPath)) --datadir=\(shellQuote(databaseDirectory))",
-                requiresAdmin: false
+            let refresh = await runStreamingShell(
+                "\(shellQuote(freshclamPath)) --config-file=\(shellQuote(freshclamConfigURL.path)) --datadir=\(shellQuote(databaseDirectory)) --stdout",
+                progressTaskID: taskID
             )
 
             if refresh.isSuccess {
@@ -572,6 +716,28 @@ actor MaintenanceCommandExecutor {
             .appendingPathComponent("database", isDirectory: true)
     }
 
+    private func ensureFreshclamConfig(for databaseDirectory: URL) throws -> URL {
+        let supportDirectory = databaseDirectory.deletingLastPathComponent()
+        try fileManager.createDirectory(at: supportDirectory, withIntermediateDirectories: true)
+
+        let configURL = supportDirectory.appendingPathComponent("freshclam.conf")
+        var lines = [
+            "DatabaseDirectory \(databaseDirectory.path)",
+            "DatabaseMirror database.clamav.net",
+            "Checks 1",
+            "Foreground yes"
+        ]
+
+        let username = NSUserName().trimmingCharacters(in: .whitespacesAndNewlines)
+        if !username.isEmpty {
+            lines.append("DatabaseOwner \(username)")
+        }
+
+        let config = lines.joined(separator: "\n") + "\n"
+        try config.write(to: configURL, atomically: true, encoding: .utf8)
+        return configURL
+    }
+
     private func clamDatabaseExists(in directory: URL) -> Bool {
         !clamDatabaseFiles(in: directory).isEmpty
     }
@@ -600,6 +766,164 @@ actor MaintenanceCommandExecutor {
         }
     }
 
+    private func clamScanTargets(from selectedComponents: [TaskScanComponent]) -> [String] {
+        let explicitTargets = selectedComponents
+            .flatMap(\.executionPaths)
+            .filter { fileManager.fileExists(atPath: $0) }
+
+        if !selectedComponents.isEmpty {
+            return Array(NSOrderedSet(array: explicitTargets)) as? [String] ?? explicitTargets
+        }
+
+        let home = fileManager.homeDirectoryForCurrentUser.path
+        let fallbackTargets = [
+            "/Applications",
+            "/Library/LaunchAgents",
+            "/Library/LaunchDaemons",
+            "\(home)/Applications",
+            "\(home)/Downloads",
+            "\(home)/Desktop",
+            "\(home)/Library/Application Support",
+            "\(home)/Library/LaunchAgents",
+            "\(home)/Library/Preferences"
+        ]
+
+        return fallbackTargets.filter { fileManager.fileExists(atPath: $0) }
+    }
+
+    private func estimatedClamScanFileCount(in targets: [String]) -> Int {
+        let uniqueTargets = Array(NSOrderedSet(array: targets)) as? [String] ?? targets
+        var total = 0
+
+        for target in uniqueTargets {
+            let targetURL = URL(fileURLWithPath: target)
+            let targetValues = try? targetURL.resourceValues(forKeys: [.isRegularFileKey, .isDirectoryKey, .isSymbolicLinkKey])
+
+            if targetValues?.isSymbolicLink == true {
+                continue
+            }
+
+            if targetValues?.isRegularFile == true {
+                total += 1
+                continue
+            }
+
+            guard targetValues?.isDirectory == true,
+                  let enumerator = fileManager.enumerator(
+                    at: targetURL,
+                    includingPropertiesForKeys: [.isRegularFileKey, .isDirectoryKey, .isSymbolicLinkKey],
+                    options: [],
+                    errorHandler: { _, _ in true }
+                  )
+            else {
+                continue
+            }
+
+            for case let fileURL as URL in enumerator {
+                let values = try? fileURL.resourceValues(forKeys: [.isRegularFileKey, .isDirectoryKey, .isSymbolicLinkKey])
+                if values?.isSymbolicLink == true {
+                    continue
+                }
+                if values?.isRegularFile == true {
+                    total += 1
+                }
+            }
+        }
+
+        return total
+    }
+
+    private func condensedClamOutput(_ output: String) -> String {
+        let lines = output
+            .components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        guard !lines.isEmpty else { return "" }
+
+        let findings = lines.filter { $0.localizedCaseInsensitiveContains(" FOUND") || $0.localizedCaseInsensitiveContains(" ERROR") }
+        let summaryIndex = lines.firstIndex { $0.localizedCaseInsensitiveContains("scan summary") }
+        let summaryLines = summaryIndex.map { Array(lines[$0...]) } ?? []
+
+        var sections: [String] = []
+        if !findings.isEmpty {
+            sections.append(findings.prefix(20).joined(separator: "\n"))
+        }
+        if !summaryLines.isEmpty {
+            sections.append(summaryLines.joined(separator: "\n"))
+        }
+
+        if sections.isEmpty {
+            return lines.suffix(12).joined(separator: "\n")
+        }
+
+        return sections.joined(separator: "\n\n")
+    }
+
+    private func parseMalwareScanOutcome(from output: String, targetTitles: [String]) -> MalwareScanOutcome {
+        let threats = output
+            .components(separatedBy: .newlines)
+            .compactMap(parseMalwareThreat)
+
+        let checkedFileCount = output
+            .components(separatedBy: .newlines)
+            .compactMap { line in
+                trailingInteger(in: line.trimmingCharacters(in: .whitespacesAndNewlines), afterPrefix: "Scanned files:")
+            }
+            .last
+
+        return MalwareScanOutcome(
+            threats: uniqueThreats(threats),
+            targetTitles: targetTitles,
+            checkedFileCount: checkedFileCount
+        )
+    }
+
+    private func parseMalwareThreat(_ rawLine: String) -> MalwareThreat? {
+        let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard line.localizedCaseInsensitiveContains(" FOUND"),
+              let separator = line.firstIndex(of: ":")
+        else {
+            return nil
+        }
+
+        let path = String(line[..<separator]).trimmingCharacters(in: .whitespacesAndNewlines)
+        let detail = String(line[line.index(after: separator)...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        let signature = detail
+            .replacingOccurrences(of: "FOUND", with: "", options: [.caseInsensitive])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard !path.isEmpty, !signature.isEmpty else { return nil }
+
+        return MalwareThreat(
+            id: malwareThreatID(path: path, signature: signature),
+            path: path,
+            signature: signature
+        )
+    }
+
+    private func malwareThreatID(path: String, signature: String) -> String {
+        "\(path)|\(signature)"
+    }
+
+    private func uniqueThreats(_ threats: [MalwareThreat]) -> [MalwareThreat] {
+        var seen = Set<String>()
+        var ordered: [MalwareThreat] = []
+
+        for threat in threats where seen.insert(threat.id).inserted {
+            ordered.append(threat)
+        }
+
+        return ordered
+    }
+
+    private func trailingInteger(in line: String, afterPrefix prefix: String) -> Int? {
+        guard line.hasPrefix(prefix) else { return nil }
+        let remainder = line.dropFirst(prefix.count).trimmingCharacters(in: .whitespacesAndNewlines)
+        let digits = remainder.components(separatedBy: CharacterSet.decimalDigits.inverted).joined()
+        return Int(digits)
+    }
+
     private func runShell(_ command: String, requiresAdmin: Bool) async -> ProcessOutput {
         let prepared = shellBootstrap + command
 
@@ -607,8 +931,13 @@ actor MaintenanceCommandExecutor {
             let source = "do shell script \"\(appleScriptEscape(prepared))\" with administrator privileges"
             return await runProcess(executable: "/usr/bin/osascript", arguments: ["-e", source])
         } else {
-            return await runProcess(executable: "/bin/zsh", arguments: ["-lc", prepared])
+            return await runProcess(executable: "/bin/zsh", arguments: ["-c", prepared])
         }
+    }
+
+    private func runStreamingShell(_ command: String, progressTaskID: MaintenanceTaskID?) async -> ProcessOutput {
+        let prepared = shellBootstrap + command
+        return await runStreamingProcess(executable: "/bin/zsh", arguments: ["-c", prepared], progressTaskID: progressTaskID)
     }
 
     private func runAppleScript(_ script: String) async -> ProcessOutput {
@@ -634,6 +963,54 @@ actor MaintenanceCommandExecutor {
                 let stderr = String(data: stderrData, encoding: .utf8) ?? ""
 
                 continuation.resume(returning: ProcessOutput(exitCode: process.terminationStatus, stdout: stdout, stderr: stderr))
+            }
+
+            do {
+                try process.run()
+            } catch {
+                continuation.resume(returning: ProcessOutput(exitCode: 1, stdout: "", stderr: error.localizedDescription))
+            }
+        }
+    }
+
+    private func runStreamingProcess(executable: String, arguments: [String], progressTaskID: MaintenanceTaskID?) async -> ProcessOutput {
+        await withCheckedContinuation { continuation in
+            let process = Process()
+            let stdoutPipe = Pipe()
+            let stderrPipe = Pipe()
+            let collector = StreamingProcessCollector()
+
+            let emit: @Sendable ([String]) -> Void = { lines in
+                guard let progressTaskID else { return }
+                for line in lines where !line.isEmpty {
+                    emitMaintenanceProgressLine(line, taskID: progressTaskID)
+                }
+            }
+
+            process.executableURL = URL(fileURLWithPath: executable)
+            process.arguments = arguments
+            process.standardOutput = stdoutPipe
+            process.standardError = stderrPipe
+
+            stdoutPipe.fileHandleForReading.readabilityHandler = { handle in
+                emit(collector.append(handle.availableData, isStdout: true))
+            }
+
+            stderrPipe.fileHandleForReading.readabilityHandler = { handle in
+                emit(collector.append(handle.availableData, isStdout: false))
+            }
+
+            process.terminationHandler = { process in
+                stdoutPipe.fileHandleForReading.readabilityHandler = nil
+                stderrPipe.fileHandleForReading.readabilityHandler = nil
+
+                emit(collector.append(stdoutPipe.fileHandleForReading.readDataToEndOfFile(), isStdout: true))
+                emit(collector.append(stderrPipe.fileHandleForReading.readDataToEndOfFile(), isStdout: false))
+                emit(collector.flushRemainder(isStdout: true))
+                emit(collector.flushRemainder(isStdout: false))
+
+                let outputs = collector.outputs()
+                continuation.resume(returning: ProcessOutput(exitCode: process.terminationStatus, stdout: outputs.stdout, stderr: outputs.stderr))
             }
 
             do {
@@ -677,6 +1054,115 @@ actor MaintenanceCommandExecutor {
         } else {
             return "\(friendlyName): \(result.summary)\n\(result.output)"
         }
+    }
+
+    func resolveMalwareThreats(_ threats: [MalwareThreat], actions: [String: MalwareThreatActionChoice]) async -> [String: MalwareThreatResolution] {
+        var results: [String: MalwareThreatResolution] = [:]
+
+        for threat in threats {
+            let action = actions[threat.id] ?? .quarantine
+            results[threat.id] = await resolveMalwareThreat(threat, action: action)
+        }
+
+        return results
+    }
+
+    private func resolveMalwareThreat(_ threat: MalwareThreat, action: MalwareThreatActionChoice) async -> MalwareThreatResolution {
+        switch action {
+        case .ignore:
+            return .ignored
+        case .quarantine:
+            return await quarantineMalwareThreat(threat)
+        case .delete:
+            return await deleteMalwareThreat(threat)
+        }
+    }
+
+    private func quarantineMalwareThreat(_ threat: MalwareThreat) async -> MalwareThreatResolution {
+        let sourceURL = URL(fileURLWithPath: threat.path)
+        guard fileManager.fileExists(atPath: sourceURL.path) else {
+            return .failed(message: localized("The file is no longer available at this path.", "Het bestand is niet langer beschikbaar op dit pad."))
+        }
+
+        do {
+            let quarantineDirectory = try malwareQuarantineDirectory()
+            try fileManager.createDirectory(at: quarantineDirectory, withIntermediateDirectories: true)
+
+            let destinationURL = uniqueQuarantineDestination(for: sourceURL, in: quarantineDirectory)
+
+            do {
+                try fileManager.moveItem(at: sourceURL, to: destinationURL)
+                return .quarantined(destination: destinationURL.path)
+            } catch {
+                if isPermissionError(error) {
+                    let result = await runShell(
+                        "mkdir -p \(shellQuote(quarantineDirectory.path)) && mv \(shellQuote(sourceURL.path)) \(shellQuote(destinationURL.path))",
+                        requiresAdmin: true
+                    )
+                    if result.isSuccess {
+                        return .quarantined(destination: destinationURL.path)
+                    }
+                    let message = result.combined.trimmingCharacters(in: .whitespacesAndNewlines)
+                    return .failed(message: message.isEmpty ? localized("The file could not be moved to quarantine.", "Het bestand kon niet naar quarantaine worden verplaatst.") : message)
+                }
+
+                return .failed(message: error.localizedDescription)
+            }
+        } catch {
+            return .failed(message: error.localizedDescription)
+        }
+    }
+
+    private func deleteMalwareThreat(_ threat: MalwareThreat) async -> MalwareThreatResolution {
+        let sourceURL = URL(fileURLWithPath: threat.path)
+        guard fileManager.fileExists(atPath: sourceURL.path) else {
+            return .failed(message: localized("The file is no longer available at this path.", "Het bestand is niet langer beschikbaar op dit pad."))
+        }
+
+        do {
+            try fileManager.removeItem(at: sourceURL)
+            return .deleted
+        } catch {
+            if isPermissionError(error) {
+                let result = await runShell("rm -rf \(shellQuote(sourceURL.path))", requiresAdmin: true)
+                let message = result.combined.trimmingCharacters(in: .whitespacesAndNewlines)
+                return result.isSuccess
+                    ? .deleted
+                    : .failed(message: message.isEmpty ? localized("The threat could not be deleted.", "De dreiging kon niet worden verwijderd.") : message)
+            }
+
+            return .failed(message: error.localizedDescription)
+        }
+    }
+
+    private func malwareQuarantineDirectory() throws -> URL {
+        let appSupport = try fileManager.url(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: true
+        )
+
+        return appSupport
+            .appendingPathComponent(AppBuildFlavor.appName, isDirectory: true)
+            .appendingPathComponent("Quarantine", isDirectory: true)
+    }
+
+    private func uniqueQuarantineDestination(for sourceURL: URL, in quarantineDirectory: URL) -> URL {
+        let baseName = sourceURL.deletingPathExtension().lastPathComponent
+        let pathExtension = sourceURL.pathExtension
+        var candidate = quarantineDirectory.appendingPathComponent(sourceURL.lastPathComponent)
+        var counter = 2
+
+        while fileManager.fileExists(atPath: candidate.path) {
+            let numberedName = "\(baseName)-\(counter)"
+            candidate = pathExtension.isEmpty
+                ? quarantineDirectory.appendingPathComponent(numberedName)
+                : quarantineDirectory.appendingPathComponent(numberedName).appendingPathExtension(pathExtension)
+            counter += 1
+        }
+
+        return candidate
     }
 
     private func uninstallApplication(named rawName: String) async -> CommandExecutionResult {

@@ -11,7 +11,7 @@ TEMP_HOME="${TEMP_HOME:-/tmp/cleanmacassistent-build-home}"
 DEVELOPER_DIR_PATH="${DEVELOPER_DIR_PATH:-/Applications/Xcode.app/Contents/Developer}"
 ASSET_CATALOG_SOURCE="$ROOT_DIR/XcodeSupport/Assets.xcassets"
 
-VERSION="${VERSION:-1.0.12}"
+VERSION="${VERSION:-1.0.21}"
 BUILD_NUMBER="${BUILD_NUMBER:-$(date +%Y%m%d%H%M)}"
 SIGN_IDENTITY="${SIGN_IDENTITY:--}"
 NOTARY_PROFILE="${NOTARY_PROFILE:-}"
@@ -172,6 +172,7 @@ function build_variant() {
   local bundle_id="$3"
   local build_kind="$4"
   local volume_name="$5"
+  local dmg_name="$6"
 
   local bundle_executable="CleanMacAssistantNative"
   local scratch_path="$BUILD_ROOT/$configuration"
@@ -184,7 +185,7 @@ function build_variant() {
   local app_stage_path="$app_stage_root/$app_name.app"
   local dmg_staging_path="/tmp/cleanmacassistent-dmg-stage/$staging_slug"
   local dmg_temp_path="/tmp/$staging_slug.dmg"
-  local dmg_path="$DMGS_DIR/$app_name.dmg"
+  local dmg_path="$DMGS_DIR/$dmg_name.dmg"
   local resources_bundle_name="CleanMacAssistantNative_CleanMacAssistantNative.bundle"
 
   log "Building $app_name ($configuration)"
@@ -246,8 +247,21 @@ require_tool ditto
 mkdir -p "$APPS_DIR" "$DMGS_DIR" "$BUILD_ROOT" "$TEMP_HOME"
 prepare_assets
 
-build_variant "release" "CleanMac Assistant" "nl.easycompzeeland.cleanmac-assistant" "Release" "CleanMac Assistant"
-build_variant "debug" "CleanMac Assistant Dev" "nl.easycompzeeland.cleanmac-assistant.dev" "Developer" "CleanMac Assistant Dev"
+build_variant \
+  "release" \
+  "CleanMac Assistant" \
+  "nl.easycompzeeland.cleanmac-assistant" \
+  "Release" \
+  "CleanMac Assistant" \
+  "CleanMac Assistant V$VERSION - First Release Universal Build"
+
+build_variant \
+  "debug" \
+  "CleanMac Assistant Dev" \
+  "nl.easycompzeeland.cleanmac-assistant.dev" \
+  "Developer" \
+  "CleanMac Assistant Dev" \
+  "CleanMac Assistant Dev V$VERSION - Developer Universal Build"
 
 log "Done"
 echo "Apps: $APPS_DIR"

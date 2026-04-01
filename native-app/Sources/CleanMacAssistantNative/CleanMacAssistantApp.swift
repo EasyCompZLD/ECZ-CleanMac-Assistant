@@ -26,6 +26,18 @@ private struct DeveloperCommandMenu: Commands {
 
     var body: some Commands {
         CommandMenu("Developer") {
+            Button(viewModel.isShowingDeveloperPanel ? "Hide Preview Tools" : "Show Preview Tools") {
+                viewModel.toggleDeveloperPanel()
+            }
+            .keyboardShortcut("m", modifiers: [.command])
+
+            Button(viewModel.isPlayingDeveloperTour ? "Stop Demo Tour" : "Start Demo Tour") {
+                viewModel.toggleDeveloperAutoTour()
+            }
+            .keyboardShortcut("s", modifiers: [.command])
+
+            Divider()
+
             Toggle(isOn: $viewModel.isPlaceboModeEnabled) {
                 Text("Placebo Mode")
             }

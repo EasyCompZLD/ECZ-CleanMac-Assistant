@@ -51,6 +51,16 @@ final class AppViewModel: ObservableObject {
     @Published var reviewInputText = ""
     @Published var applicationPickerQuery = ""
     @Published var taskOutputs: [MaintenanceTaskID: String] = [:]
+    @Published var liveTaskPhase = ""
+    @Published var liveTaskCurrentItem = ""
+    @Published var liveTaskProcessedCount = 0
+    @Published var liveTaskExpectedCount = 0
+    @Published var liveTaskRecentLines: [String] = []
+    @Published var liveDetectedThreats: [MalwareThreat] = []
+    @Published var latestMalwareOutcome: MalwareScanOutcome?
+    @Published var malwareThreatActionSelections: [String: MalwareThreatActionChoice] = [:]
+    @Published var malwareThreatResolutions: [String: MalwareThreatResolution] = [:]
+    @Published var isApplyingMalwareThreatActions = false
     @Published var isShowingAbout = false
     @Published private(set) var managedFileAccessFolders: [ManagedFileAccessFolder] = ManagedFileAccessStore.storedFolders()
     @Published private(set) var installedApplications: [InstalledApplicationRecord] = []
@@ -71,16 +81,28 @@ final class AppViewModel: ObservableObject {
             debugLanguageOverride.persist()
         }
     }
+    @Published var isPlayingDeveloperTour = false
+    @Published var developerTourTitle = ""
+    @Published var developerTourDetail = ""
+    @Published var developerTourStepIndex = 0
+    @Published var developerTourStepCount = 0
     #endif
 
     private let executor = MaintenanceCommandExecutor()
     private let scanner = MaintenanceScanner()
     private let updateChecker = UpdateChecker()
     private let selfUpdater = AppSelfUpdater()
+    private var progressObserver: NSObjectProtocol?
+    private var activeRunTasks: [MaintenanceTaskDefinition] = []
+    private var runStartedAt: Date?
+    private var currentTaskStartedAt: Date?
 
     private var savedPromptValues: [MaintenanceTaskID: String] = [:]
     private var savedComponentSelections: [MaintenanceTaskID: Set<String>] = [:]
     private var reviewedConfirmationTasks: Set<MaintenanceTaskID> = []
+    #if DEVELOPER_BUILD
+    private var developerTourTask: Task<Void, Never>?
+    #endif
 
     init() {
         enabledTaskIDs = Set(MaintenanceCatalog.tasks.map(\.id))
@@ -92,6 +114,22 @@ final class AppViewModel: ObservableObject {
                 isError: false
             )
         ]
+
+        progressObserver = NotificationCenter.default.addObserver(
+            forName: MaintenanceProgressNotification.name,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let taskIDRaw = notification.userInfo?[MaintenanceProgressNotification.taskIDKey] as? String,
+                  let line = notification.userInfo?[MaintenanceProgressNotification.lineKey] as? String
+            else {
+                return
+            }
+
+            Task { @MainActor [weak self] in
+                self?.consumeMaintenanceProgress(taskIDRaw: taskIDRaw, line: line)
+            }
+        }
 
         Task {
             await scanCurrentModule()
@@ -195,8 +233,61 @@ final class AppViewModel: ObservableObject {
         )
     }
 
+    var selectedModuleTaskReports: [RunTaskReport] {
+        selectedModuleTasks.compactMap { task in
+            let state = taskStates[task.id] ?? .idle
+            let output = latestTaskOutput(for: task.id)
+            guard state.isTerminal || output != nil else {
+                return nil
+            }
+
+            return RunTaskReport(
+                id: task.id,
+                title: task.title.appLocalized,
+                state: state,
+                summary: state.resultSummary ?? task.subtitle.appLocalized,
+                output: output
+            )
+        }
+    }
+
+    var hasSelectedModuleTaskResults: Bool {
+        !selectedModuleTaskReports.isEmpty
+    }
+
+    var selectedModuleCompletedResultCount: Int {
+        selectedModuleTaskReports.reduce(into: 0) { count, report in
+            if case .succeeded = report.state {
+                count += 1
+            }
+        }
+    }
+
+    var selectedModuleSkippedResultCount: Int {
+        selectedModuleTaskReports.reduce(into: 0) { count, report in
+            if case .skipped = report.state {
+                count += 1
+            }
+        }
+    }
+
+    var selectedModuleIssueResultCount: Int {
+        selectedModuleTaskReports.reduce(into: 0) { count, report in
+            if case .failed = report.state {
+                count += 1
+            }
+        }
+    }
+
+    var selectedModuleResultSummary: String {
+        localized(
+            "\(selectedModuleCompletedResultCount) done • \(selectedModuleSkippedResultCount) skipped • \(selectedModuleIssueResultCount) issues. The tool cards below keep each result separated per action.",
+            "\(selectedModuleCompletedResultCount) klaar • \(selectedModuleSkippedResultCount) overgeslagen • \(selectedModuleIssueResultCount) problemen. De toolkaarten hieronder houden elk resultaat per actie gescheiden."
+        )
+    }
+
     var shouldShowActivityConsole: Bool {
-        activityEntries.count > 1 || lastRunReport != nil
+        !hasSelectedModuleTaskResults && (activityEntries.count > 1 || lastRunReport != nil)
     }
 
     var hasManagedFileAccess: Bool {
@@ -262,7 +353,34 @@ final class AppViewModel: ObservableObject {
 
     var runProgressFraction: Double {
         guard totalTaskCount > 0 else { return 0 }
-        return Double(completedTaskCount) / Double(totalTaskCount)
+        let completed = Double(completedTaskCount)
+        let currentFraction = currentTaskProgressFraction
+        return min(max((completed + currentFraction) / Double(totalTaskCount), 0), 1)
+    }
+
+    var visibleProgressFraction: Double {
+        if currentTaskID == .malware, liveTaskExpectedCount > 0 {
+            return currentTaskProgressFraction
+        }
+        return runProgressFraction
+    }
+
+    var visibleProgressPercent: Int {
+        Int((visibleProgressFraction * 100).rounded())
+    }
+
+    var visibleProgressCaption: String {
+        if currentTaskID == .malware, liveTaskExpectedCount > 0 {
+            return localized("scanned", "gescand")
+        }
+        return localized("done", "klaar")
+    }
+
+    var visibleProgressSectionTitle: String {
+        if currentTaskID == .malware, liveTaskExpectedCount > 0 {
+            return localized("Live scan progress", "Live scanvoortgang")
+        }
+        return localized("Live progress", "Live voortgang")
     }
 
     var runProgressTitle: String {
@@ -282,12 +400,161 @@ final class AppViewModel: ObservableObject {
             return localized("Choose a page and review what can be cleaned.", "Kies een pagina en bekijk wat opgeschoond kan worden.")
         }
 
+        if let progressSummary = liveTaskProgressSummary {
+            return progressSummary
+        }
+
+        if let livePhase = liveTaskPhase.trimmed.nilIfEmpty {
+            return livePhase
+        }
+
         if currentTaskID != nil {
             let step = min(completedTaskCount + 1, totalTaskCount)
             return localized("Step \(step) of \(totalTaskCount)", "Stap \(step) van \(totalTaskCount)")
         }
 
         return localized("\(completedTaskCount) of \(totalTaskCount) steps finished", "\(completedTaskCount) van \(totalTaskCount) stappen voltooid")
+    }
+
+    func runElapsedChipText(at now: Date) -> String? {
+        guard let elapsed = runElapsedSeconds(at: now) else { return nil }
+        return localized("Elapsed \(formattedDuration(elapsed))", "Verstreken \(formattedDuration(elapsed))")
+    }
+
+    func runRemainingChipText(at now: Date) -> String? {
+        guard let remaining = runRemainingSeconds(at: now) else { return nil }
+        return localized("ETA \(formattedDuration(remaining)) left", "ETA nog \(formattedDuration(remaining))")
+    }
+
+    func runCompletionTimeChipText(at now: Date) -> String? {
+        guard let remaining = runRemainingSeconds(at: now) else { return nil }
+        return localized(
+            "Around \(formattedClock(now.addingTimeInterval(remaining)))",
+            "Rond \(formattedClock(now.addingTimeInterval(remaining)))"
+        )
+    }
+
+    func currentTaskTimingDetail(at now: Date) -> String {
+        let elapsed = currentTaskElapsedSeconds(at: now)
+        let remaining = currentTaskRemainingSeconds(at: now)
+
+        switch (remaining, elapsed) {
+        case let (.some(remaining), .some(elapsed)):
+            return localized(
+                "ETA \(formattedDuration(remaining)) left • \(formattedDuration(elapsed)) elapsed",
+                "ETA nog \(formattedDuration(remaining)) • \(formattedDuration(elapsed)) verstreken"
+            )
+        case let (.some(remaining), nil):
+            return localized(
+                "ETA \(formattedDuration(remaining)) left",
+                "ETA nog \(formattedDuration(remaining))"
+            )
+        case let (nil, .some(elapsed)):
+            return localized(
+                "\(formattedDuration(elapsed)) elapsed",
+                "\(formattedDuration(elapsed)) verstreken"
+            )
+        case (nil, nil):
+            return localized("Calculating time", "Tijd wordt berekend")
+        }
+    }
+
+    var hasLiveTaskProgress: Bool {
+        !liveTaskCurrentItem.isEmpty || liveTaskProcessedCount > 0 || !liveTaskRecentLines.isEmpty
+    }
+
+    var liveTaskCurrentItemLabel: String? {
+        liveTaskCurrentItem.trimmed.nilIfEmpty
+    }
+
+    var liveTaskProcessedCountLabel: String? {
+        guard liveTaskProcessedCount > 0 else { return nil }
+
+        if currentTaskID == .malware {
+            if liveTaskExpectedCount > 0 {
+                return localized(
+                    "\(liveTaskProcessedCount) of \(liveTaskExpectedCount) files checked",
+                    "\(liveTaskProcessedCount) van \(liveTaskExpectedCount) bestanden gecontroleerd"
+                )
+            }
+            return localized(
+                "\(liveTaskProcessedCount) files checked",
+                "\(liveTaskProcessedCount) bestanden gecontroleerd"
+            )
+        }
+
+        return localized(
+            "\(liveTaskProcessedCount) updates received",
+            "\(liveTaskProcessedCount) updates ontvangen"
+        )
+    }
+
+    var liveTaskSectionTitle: String {
+        currentTaskID == .malware
+            ? localized("Current scan", "Huidige scan")
+            : localized("Recent", "Recent")
+    }
+
+    var liveThreatCount: Int {
+        liveDetectedThreats.count
+    }
+
+    var liveThreatStatusValue: String {
+        if liveDetectedThreats.isEmpty {
+            return localized("None so far", "Nog niets")
+        }
+
+        let count = liveDetectedThreats.count
+        return count == 1
+            ? localized("1 possible threat", "1 mogelijke dreiging")
+            : localized("\(count) possible threats", "\(count) mogelijke dreigingen")
+    }
+
+    var liveThreatStatusDetail: String {
+        guard let latestThreat = liveDetectedThreats.first else {
+            return localized("ClamAV will surface detections here as soon as they appear.", "ClamAV toont hier detecties zodra ze opduiken.")
+        }
+
+        return localized(
+            "\(latestThreat.signature)\n\(compactHomePaths(in: latestThreat.path))",
+            "\(latestThreat.signature)\n\(compactHomePaths(in: latestThreat.path))"
+        )
+    }
+
+    var hasMalwareThreatsInLatestRun: Bool {
+        !(latestMalwareOutcome?.threats.isEmpty ?? true)
+    }
+
+    var latestMalwareThreats: [MalwareThreat] {
+        latestMalwareOutcome?.threats ?? []
+    }
+
+    var malwareThreatCountLabel: String {
+        let count = latestMalwareThreats.count
+        return count == 1
+            ? localized("1 threat needs a decision", "1 dreiging wacht op uw keuze")
+            : localized("\(count) threats need a decision", "\(count) dreigingen wachten op uw keuze")
+    }
+
+    var latestMalwareTargetSummary: String {
+        let targets = latestMalwareOutcome?.targetTitles ?? []
+        guard !targets.isEmpty else {
+            return localized("Focused scan areas selected in Review.", "Gerichte scangebieden geselecteerd in Bekijken.")
+        }
+        return targets.joined(separator: " • ")
+    }
+
+    var liveTaskProgressSummary: String? {
+        guard currentTaskID == .malware, liveTaskExpectedCount > 0 else { return nil }
+        let percent = Int((currentTaskProgressFraction * 100).rounded())
+        return localized(
+            "\(percent)% of the selected malware scan finished",
+            "\(percent)% van de geselecteerde malwarescan is voltooid"
+        )
+    }
+
+    var canApplyMalwareThreatActions: Bool {
+        hasMalwareThreatsInLatestRun && hasPendingMalwareThreatActions && !isApplyingMalwareThreatActions
     }
 
     var activeReviewTask: MaintenanceTaskDefinition? {
@@ -351,6 +618,13 @@ final class AppViewModel: ObservableObject {
             }
 
             return localized("Ready to run", "Klaar om uit te voeren")
+        }
+
+        if activeReviewTask?.id == .malware {
+            let selectedCount = selectedReviewComponents.count
+            return selectedCount == 1
+                ? localized("1 scan area selected", "1 scangebied geselecteerd")
+                : localized("\(selectedCount) scan areas selected", "\(selectedCount) scangebieden geselecteerd")
         }
 
         return selectionSummary(for: selectedReviewComponents)
@@ -518,7 +792,9 @@ final class AppViewModel: ObservableObject {
             if moduleID == .applications {
                 await ensureInstalledApplicationsLoaded()
             }
-            await scanCurrentModule()
+            if shouldAutoScanModuleOnSelection(moduleID) {
+                await scanCurrentModule()
+            }
         }
     }
 
@@ -543,14 +819,13 @@ final class AppViewModel: ObservableObject {
         selectedModuleID = .smartCare
 
         Task {
-            await scanCurrentModule()
             let module = MaintenanceCatalog.module(for: .smartCare)
             let tasks = MaintenanceCatalog.tasks(for: module.id).filter { enabledTaskIDs.contains($0.id) }
             guard !tasks.isEmpty else {
                 appendActivity(title: module.title, detail: localized("No tasks are enabled in this module right now.", "Er zijn op deze pagina nu geen taken ingeschakeld."), isError: true)
                 return
             }
-            await execute(tasks: tasks, runTitle: module.title)
+            await runModuleFlow(module: module, tasks: tasks)
         }
     }
 
@@ -566,13 +841,12 @@ final class AppViewModel: ObservableObject {
         selectedModuleID = module.id
 
         Task {
-            await scanCurrentModule()
             let tasks = MaintenanceCatalog.tasks(for: module.id).filter { enabledTaskIDs.contains($0.id) }
             guard !tasks.isEmpty else {
                 appendActivity(title: module.title, detail: localized("No tasks are enabled in this module right now.", "Er zijn op deze pagina nu geen taken ingeschakeld."), isError: true)
                 return
             }
-            await execute(tasks: tasks, runTitle: module.title)
+            await runModuleFlow(module: module, tasks: tasks)
         }
     }
 
@@ -624,7 +898,7 @@ final class AppViewModel: ObservableObject {
         )
 
         Task {
-            await scanCurrentModule()
+            await scanCurrentModule(force: true)
         }
     }
 
@@ -641,7 +915,7 @@ final class AppViewModel: ObservableObject {
         )
 
         Task {
-            await scanCurrentModule()
+            await scanCurrentModule(force: true)
         }
     }
 
@@ -661,6 +935,9 @@ final class AppViewModel: ObservableObject {
 
     func dismissRunReport() {
         lastRunReport = nil
+        latestMalwareOutcome = nil
+        malwareThreatActionSelections = [:]
+        malwareThreatResolutions = [:]
     }
 
     #if DEVELOPER_BUILD
@@ -674,6 +951,53 @@ final class AppViewModel: ObservableObject {
 
     func closeDeveloperPanel() {
         isShowingDeveloperPanel = false
+    }
+
+    func toggleDeveloperAutoTour() {
+        if isPlayingDeveloperTour {
+            stopDeveloperAutoTour()
+        } else {
+            startDeveloperAutoTour()
+        }
+    }
+
+    func startDeveloperAutoTour() {
+        guard !isPlayingDeveloperTour else { return }
+
+        if !isPlaceboModeEnabled {
+            isPlaceboModeEnabled = true
+        }
+
+        developerTourTask?.cancel()
+        isShowingDeveloperPanel = false
+        dismissRunReport()
+        closeReview(persist: false)
+        closeAbout()
+
+        isPlayingDeveloperTour = true
+        developerTourStepIndex = 0
+        developerTourStepCount = 8
+        developerTourTitle = localized("Starting demo", "Demo starten")
+        developerTourDetail = localized(
+            "Preparing a hands-off preview tour for screen recording.",
+            "Bezig met het voorbereiden van een hands-off previewtour voor screen recording."
+        )
+
+        developerTourTask = Task { @MainActor in
+            await runDeveloperAutoTour()
+        }
+    }
+
+    func stopDeveloperAutoTour() {
+        developerTourTask?.cancel()
+        developerTourTask = nil
+        finishDeveloperAutoTour(
+            title: localized("Demo stopped", "Demo gestopt"),
+            detail: localized(
+                "The automatic preview tour was stopped. You can reopen Preview Tools at any time.",
+                "De automatische previewtour is gestopt. U kunt Preview Tools altijd opnieuw openen."
+            )
+        )
     }
     #endif
 
@@ -831,9 +1155,13 @@ final class AppViewModel: ObservableObject {
         NSWorkspace.shared.open(downloadURL)
     }
 
-    func scanCurrentModule() async {
+    func scanCurrentModule(force: Bool = false) async {
         let tasks = selectedModuleTasks
         guard !tasks.isEmpty else { return }
+
+        if selectedModuleID == .files && !force {
+            return
+        }
 
         isScanningModule = true
         for task in tasks {
@@ -871,6 +1199,11 @@ final class AppViewModel: ObservableObject {
         completedTaskCount = 0
         totalTaskCount = tasks.count
         lastRunReport = nil
+        clearLiveTaskProgress()
+        beginRunTiming(tasks: tasks)
+        latestMalwareOutcome = nil
+        malwareThreatActionSelections = [:]
+        malwareThreatResolutions = [:]
 
         for task in tasks {
             taskStates[task.id] = .queued
@@ -883,9 +1216,13 @@ final class AppViewModel: ObservableObject {
         var skippedCount = 0
         var failureCount = 0
 
+        let shouldRefreshInstalledApplications = tasks.contains { $0.id == .uninstall }
+
         for task in tasks {
             currentTaskID = task.id
+            currentTaskStartedAt = Date()
             taskStates[task.id] = .running
+            resetLiveTaskProgress(for: task)
             let currentStep = completedCount + skippedCount + failureCount + 1
             appendActivity(title: task.title, detail: localized("Working on step \(currentStep) of \(tasks.count).", "Bezig met stap \(currentStep) van \(tasks.count)."), isError: false)
 
@@ -899,6 +1236,14 @@ final class AppViewModel: ObservableObject {
             case let .ready(request):
                 let result = await executor.run(task: task, request: request)
 
+                let visibleMalwareThreatCount: Int
+                if task.id == .malware {
+                    prepareLatestMalwareOutcome(result.malwareOutcome)
+                    visibleMalwareThreatCount = latestMalwareThreats.count
+                } else {
+                    visibleMalwareThreatCount = 0
+                }
+
                 let trimmedOutput = result.output.trimmed
                 if trimmedOutput.isEmpty {
                     taskOutputs.removeValue(forKey: task.id)
@@ -906,7 +1251,19 @@ final class AppViewModel: ObservableObject {
                     taskOutputs[task.id] = trimmedOutput
                 }
 
-                if result.success {
+                let treatedAsIssue = task.id == .malware && visibleMalwareThreatCount > 0
+                if treatedAsIssue {
+                    let summary = visibleMalwareThreatCount == 1
+                        ? localized("1 potential threat needs your review.", "1 mogelijke dreiging wacht op uw controle.")
+                        : localized("\(visibleMalwareThreatCount) potential threats need your review.", "\(visibleMalwareThreatCount) mogelijke dreigingen wachten op uw controle.")
+                    taskStates[task.id] = .failed(summary: summary)
+                    failureCount += 1
+                } else if task.id == .malware,
+                          let rawThreatCount = result.malwareOutcome?.threats.count,
+                          rawThreatCount > 0 {
+                    taskStates[task.id] = .succeeded(summary: localized("Only previously ignored detections were found.", "Er zijn alleen eerder genegeerde detecties gevonden."))
+                    completedCount += 1
+                } else if result.success {
                     taskStates[task.id] = .succeeded(summary: result.summary)
                     completedCount += 1
                 } else {
@@ -915,8 +1272,8 @@ final class AppViewModel: ObservableObject {
                 }
 
                 let detail = result.output.isEmpty ? result.summary : result.summary + "\n\n" + result.output
-                appendActivity(title: task.title, detail: detail, isError: !result.success)
-                playTaskCompletionSound(success: result.success)
+                appendActivity(title: task.title, detail: detail, isError: treatedAsIssue || !result.success)
+                playTaskCompletionSound(success: !(treatedAsIssue || !result.success))
 
                 let refreshedScan = await scanner.scan(taskID: task.id)
                 scanStates[task.id] = refreshedScan
@@ -925,8 +1282,14 @@ final class AppViewModel: ObservableObject {
             completedTaskCount = completedCount + skippedCount + failureCount
         }
 
+        if shouldRefreshInstalledApplications {
+            await ensureInstalledApplicationsLoaded(force: true)
+        }
+
         currentTaskID = nil
+        currentTaskStartedAt = nil
         isRunning = false
+        clearLiveTaskProgress()
         lastRunSummary = localized("\(runTitle.appLocalized): \(completedCount) completed, \(skippedCount) skipped, \(failureCount) with issues.", "\(runTitle.appLocalized): \(completedCount) voltooid, \(skippedCount) overgeslagen, \(failureCount) met problemen.")
         lastRunReport = buildRunReport(
             title: runTitle,
@@ -942,8 +1305,9 @@ final class AppViewModel: ObservableObject {
         currentRunTitle = ""
         completedTaskCount = 0
         totalTaskCount = 0
+        clearRunTiming()
 
-        await scanCurrentModule()
+        await scanCurrentModule(force: true)
     }
 
     private func appendActivity(title: String, detail: String, isError: Bool) {
@@ -951,6 +1315,298 @@ final class AppViewModel: ObservableObject {
             ActivityEntry(timestamp: Date(), title: title, detail: detail, isError: isError),
             at: 0
         )
+    }
+
+    private func consumeMaintenanceProgress(taskIDRaw: String, line: String) {
+        guard let taskID = MaintenanceTaskID(rawValue: taskIDRaw),
+              taskID == currentTaskID
+        else {
+            return
+        }
+
+        updateLiveTaskProgress(taskID: taskID, rawLine: line)
+    }
+
+    private func resetLiveTaskProgress(for task: MaintenanceTaskDefinition) {
+        liveTaskPhase = initialLivePhase(for: task.id)
+        liveTaskCurrentItem = ""
+        liveTaskProcessedCount = 0
+        liveTaskExpectedCount = 0
+        liveTaskRecentLines = []
+        liveDetectedThreats = []
+    }
+
+    private func clearLiveTaskProgress() {
+        liveTaskPhase = ""
+        liveTaskCurrentItem = ""
+        liveTaskProcessedCount = 0
+        liveTaskExpectedCount = 0
+        liveTaskRecentLines = []
+        liveDetectedThreats = []
+    }
+
+    private func initialLivePhase(for taskID: MaintenanceTaskID) -> String {
+        switch taskID {
+        case .malware:
+            return localized(
+                "Preparing ClamAV signatures and focused scan targets.",
+                "ClamAV-signatures en gerichte scanlocaties worden voorbereid."
+            )
+        default:
+            return ""
+        }
+    }
+
+    private func updateLiveTaskProgress(taskID: MaintenanceTaskID, rawLine: String) {
+        let trimmedRawLine = rawLine.trimmed
+        guard !trimmedRawLine.isEmpty else { return }
+
+        switch taskID {
+        case .malware:
+            updateMalwareLiveProgress(with: trimmedRawLine)
+        default:
+            let compactedLine = compactHomePaths(in: trimmedRawLine).trimmed
+            liveTaskPhase = compactedLine
+            if !liveTaskRecentLines.contains(compactedLine) {
+                liveTaskRecentLines = Array(([compactedLine] + liveTaskRecentLines).prefix(4))
+            }
+        }
+    }
+
+    private func updateMalwareLiveProgress(with line: String) {
+        if line == "__ECZ_SCAN_PREPARING_SCOPE__" {
+            liveTaskPhase = localized(
+                "Counting selected files so the scan progress can stay accurate.",
+                "Geselecteerde bestanden worden geteld zodat de scanvoortgang nauwkeurig blijft."
+            )
+            return
+        }
+
+        if let estimatedTotal = trailingInteger(in: line, afterPrefix: "__ECZ_SCAN_TOTAL_FILES__:") {
+            liveTaskExpectedCount = max(estimatedTotal, liveTaskProcessedCount)
+            liveTaskPhase = localized(
+                "Preparing to scan about \(liveTaskExpectedCount) files across the selected areas.",
+                "Bereidt een scan voor van ongeveer \(liveTaskExpectedCount) bestanden in de geselecteerde gebieden."
+            )
+            return
+        }
+
+        if let threat = parseLiveMalwareThreat(from: line),
+           !IgnoredMalwareThreatStore.contains(threat.id),
+           !liveDetectedThreats.contains(where: { $0.id == threat.id }) {
+            liveDetectedThreats.insert(threat, at: 0)
+        }
+
+        let displayLine = compactHomePaths(in: line)
+
+        if line.localizedCaseInsensitiveContains("scan summary") {
+            liveTaskPhase = localized("Wrapping up scan summary.", "Scansamenvatting wordt afgerond.")
+        } else if line.localizedCaseInsensitiveContains("download") || line.localizedCaseInsensitiveContains("database") || line.localizedCaseInsensitiveContains("bytecode") {
+            liveTaskPhase = localized("Refreshing malware signatures.", "Malwaresignatures worden vernieuwd.")
+        } else if let scannedFiles = trailingInteger(in: line, afterPrefix: "Scanned files:") {
+            liveTaskProcessedCount = max(liveTaskProcessedCount, scannedFiles)
+            liveTaskExpectedCount = max(liveTaskExpectedCount, scannedFiles)
+            liveTaskPhase = localized("Summarizing checked files.", "Gecontroleerde bestanden worden samengevat.")
+        } else if let currentItem = clamPath(from: line) {
+            liveTaskProcessedCount += 1
+            liveTaskCurrentItem = compactHomePaths(in: currentItem)
+            liveTaskPhase = line.localizedCaseInsensitiveContains("FOUND")
+                ? localized("Potential threat detected. Reviewing result.", "Mogelijke dreiging gevonden. Resultaat wordt nagekeken.")
+                : localized("Scanning files and startup locations.", "Bestanden en opstartlocaties worden gescand.")
+        }
+
+        let shouldStoreLine =
+            line.localizedCaseInsensitiveContains("FOUND") ||
+            line.localizedCaseInsensitiveContains("ERROR") ||
+            line.localizedCaseInsensitiveContains("database") ||
+            line.localizedCaseInsensitiveContains("download") ||
+            line.localizedCaseInsensitiveContains("scan summary") ||
+            clamPath(from: line) != nil
+
+        if shouldStoreLine, !liveTaskRecentLines.contains(displayLine) {
+            liveTaskRecentLines = Array(([displayLine] + liveTaskRecentLines).prefix(4))
+        }
+    }
+
+    private func parseLiveMalwareThreat(from line: String) -> MalwareThreat? {
+        guard line.localizedCaseInsensitiveContains(" FOUND"),
+              let separator = line.firstIndex(of: ":")
+        else {
+            return nil
+        }
+
+        let path = String(line[..<separator]).trimmed
+        let signature = String(line[line.index(after: separator)...])
+            .replacingOccurrences(of: "FOUND", with: "", options: [.caseInsensitive])
+            .trimmed
+
+        guard !path.isEmpty, !signature.isEmpty else { return nil }
+
+        return MalwareThreat(id: "\(path)|\(signature)", path: path, signature: signature)
+    }
+
+    private func prepareLatestMalwareOutcome(_ outcome: MalwareScanOutcome?) {
+        let mergedThreats = uniqueMalwareThreats((outcome?.threats ?? []) + liveDetectedThreats)
+        let visibleThreats = mergedThreats.filter { !IgnoredMalwareThreatStore.contains($0.id) }
+        if let outcome {
+            latestMalwareOutcome = MalwareScanOutcome(
+                threats: visibleThreats,
+                targetTitles: outcome.targetTitles,
+                checkedFileCount: outcome.checkedFileCount
+            )
+        } else if !visibleThreats.isEmpty {
+            latestMalwareOutcome = MalwareScanOutcome(
+                threats: visibleThreats,
+                targetTitles: [],
+                checkedFileCount: nil
+            )
+        } else {
+            latestMalwareOutcome = nil
+        }
+        malwareThreatActionSelections = [:]
+        malwareThreatResolutions = [:]
+
+        for threat in latestMalwareThreats {
+            malwareThreatActionSelections[threat.id] = .quarantine
+            malwareThreatResolutions[threat.id] = .pending
+        }
+    }
+
+    private func uniqueMalwareThreats(_ threats: [MalwareThreat]) -> [MalwareThreat] {
+        var seen = Set<String>()
+        var ordered: [MalwareThreat] = []
+
+        for threat in threats where seen.insert(threat.id).inserted {
+            ordered.append(threat)
+        }
+
+        return ordered
+    }
+
+    func malwareThreatAction(for threat: MalwareThreat) -> MalwareThreatActionChoice {
+        malwareThreatActionSelections[threat.id] ?? .quarantine
+    }
+
+    func setMalwareThreatAction(_ action: MalwareThreatActionChoice, for threatID: String) {
+        malwareThreatActionSelections[threatID] = action
+        if malwareThreatResolutions[threatID] != .pending {
+            malwareThreatResolutions[threatID] = .pending
+        }
+    }
+
+    func malwareThreatResolution(for threatID: String) -> MalwareThreatResolution {
+        malwareThreatResolutions[threatID] ?? .pending
+    }
+
+    func applyMalwareThreatActions() {
+        let threats = latestMalwareThreats
+        guard !threats.isEmpty, !isApplyingMalwareThreatActions else { return }
+
+        isApplyingMalwareThreatActions = true
+
+        Task {
+            let results = await executor.resolveMalwareThreats(threats, actions: malwareThreatActionSelections)
+            malwareThreatResolutions = results
+            isApplyingMalwareThreatActions = false
+
+            let ignored = results.values.filter { if case .ignored = $0 { return true } else { return false } }.count
+            let quarantined = results.values.filter { if case .quarantined = $0 { return true } else { return false } }.count
+            let deleted = results.values.filter { if case .deleted = $0 { return true } else { return false } }.count
+            let failures = results.values.filter { if case .failed = $0 { return true } else { return false } }.count
+
+            let summary = localized(
+                "Ignored: \(ignored) • Quarantined: \(quarantined) • Deleted: \(deleted) • Issues: \(failures)",
+                "Genegeerd: \(ignored) • In quarantaine: \(quarantined) • Verwijderd: \(deleted) • Problemen: \(failures)"
+            )
+
+            let ignoredThreatIDs = results
+                .filter { entry in
+                    if case .ignored = entry.value {
+                        return true
+                    }
+                    return false
+                }
+                .map(\.key)
+            let nonIgnoredThreatIDs = results
+                .filter { entry in
+                    if case .ignored = entry.value {
+                        return false
+                    }
+                    return true
+                }
+                .map(\.key)
+            IgnoredMalwareThreatStore.insert(ignoredThreatIDs)
+            IgnoredMalwareThreatStore.remove(nonIgnoredThreatIDs)
+
+            let existingOutput = taskOutputs[.malware]?.trimmed ?? ""
+            let actionOutput = localized(
+                "Threat action summary\n\(summary)",
+                "Samenvatting dreigingsacties\n\(summary)"
+            )
+            taskOutputs[.malware] = existingOutput.isEmpty
+                ? actionOutput
+                : existingOutput + "\n\n" + actionOutput
+
+            taskStates[.malware] = failures > 0
+                ? .failed(summary: localized("Some threat actions still need attention.", "Sommige dreigingsacties vragen nog aandacht."))
+                : .succeeded(summary: localized("Threat review completed.", "Dreigingscontrole voltooid."))
+            refreshLastRunReport()
+
+            appendActivity(
+                title: localized("Threat actions applied", "Dreigingsacties toegepast"),
+                detail: summary,
+                isError: failures > 0
+            )
+        }
+    }
+
+    private var hasPendingMalwareThreatActions: Bool {
+        latestMalwareThreats.contains { malwareThreatResolution(for: $0.id) == .pending }
+    }
+
+    private func shouldAutoScanModuleOnSelection(_ moduleID: MaintenanceModuleID) -> Bool {
+        moduleID != .files
+    }
+
+    private func runModuleFlow(module: MaintenanceModule, tasks: [MaintenanceTaskDefinition]) async {
+        await scanCurrentModule(force: true)
+
+        if let blockingTask = firstBlockingReviewTask(in: tasks) {
+            appendActivity(
+                title: module.title,
+                detail: localized(
+                    "\(blockingTask.title.appLocalized) still needs a quick Review before this page can continue. Review it once, then run the page again.",
+                    "\(blockingTask.title.appLocalized) heeft nog een korte controle in Bekijken nodig voordat deze pagina verder kan. Bekijk dit onderdeel eenmalig en voer de pagina daarna opnieuw uit."
+                ),
+                isError: false
+            )
+            await openReviewForModuleRun(blockingTask)
+            return
+        }
+
+        await execute(tasks: tasks, runTitle: module.title)
+    }
+
+    private func compactHomePaths(in line: String) -> String {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        return line.replacingOccurrences(of: home, with: "~")
+    }
+
+    private func clamPath(from line: String) -> String? {
+        guard line.hasPrefix("/") || line.hasPrefix("~"),
+              let separator = line.firstIndex(of: ":")
+        else {
+            return nil
+        }
+
+        let path = String(line[..<separator]).trimmed
+        return path.isEmpty ? nil : path
+    }
+
+    private func trailingInteger(in line: String, afterPrefix prefix: String) -> Int? {
+        guard line.hasPrefix(prefix) else { return nil }
+        let remainder = line.dropFirst(prefix.count).trimmingCharacters(in: .whitespacesAndNewlines)
+        return Int(remainder.components(separatedBy: CharacterSet.decimalDigits.inverted).joined())
     }
 
     private func open(urlString: String) {
@@ -1019,7 +1675,11 @@ final class AppViewModel: ObservableObject {
         }
 
         let actionableComponents = selectedComponents.filter { $0.cleanupAction != nil }
-        let request = TaskExecutionRequest(input: inputValue, selectedComponents: actionableComponents)
+        let request = TaskExecutionRequest(
+            input: inputValue,
+            selectedComponents: actionableComponents,
+            selectedReviewComponents: selectedComponents
+        )
         return .ready(request: request)
     }
 
@@ -1095,6 +1755,72 @@ final class AppViewModel: ObservableObject {
         }
     }
 
+    private func firstBlockingReviewTask(in tasks: [MaintenanceTaskDefinition]) -> MaintenanceTaskDefinition? {
+        for task in tasks {
+            let savedInput = savedPrompt(for: task.id).trimmed.nilIfEmpty
+            let needsPromptInput = task.prompt != nil && savedInput == nil
+            let needsConfirmation = resolvedConfirmation(for: task, inputValue: savedInput) != nil
+                && !reviewedConfirmationTasks.contains(task.id)
+            let hasReviewComponents = !reviewComponents(for: task.id).isEmpty
+            let needsSelection = hasReviewComponents && selectedComponentsForExecution(for: task).isEmpty
+
+            if needsPromptInput || needsConfirmation || needsSelection {
+                return task
+            }
+        }
+
+        return nil
+    }
+
+    private func openReviewForModuleRun(_ task: MaintenanceTaskDefinition) async {
+        reviewTaskID = task.id
+        reviewSelections = reviewedSelection(for: task.id)
+        reviewInputText = savedPrompt(for: task.id)
+        applicationPickerQuery = ""
+
+        switch task.id {
+        case .uninstall, .reset:
+            await ensureInstalledApplicationsLoaded()
+        default:
+            break
+        }
+    }
+
+    private func refreshLastRunReport() {
+        guard let existingReport = lastRunReport else { return }
+
+        let taskDefinitions = existingReport.tasks.map { MaintenanceCatalog.task(for: $0.id) }
+        let completedCount = taskDefinitions.reduce(into: 0) { count, task in
+            if case .succeeded = taskStates[task.id] ?? .idle {
+                count += 1
+            }
+        }
+        let skippedCount = taskDefinitions.reduce(into: 0) { count, task in
+            if case .skipped = taskStates[task.id] ?? .idle {
+                count += 1
+            }
+        }
+        let failureCount = taskDefinitions.reduce(into: 0) { count, task in
+            if case .failed = taskStates[task.id] ?? .idle {
+                count += 1
+            }
+        }
+
+        let summary = localized(
+            "\(existingReport.title.appLocalized): \(completedCount) completed, \(skippedCount) skipped, \(failureCount) with issues.",
+            "\(existingReport.title.appLocalized): \(completedCount) voltooid, \(skippedCount) overgeslagen, \(failureCount) met problemen."
+        )
+        lastRunSummary = summary
+        lastRunReport = buildRunReport(
+            title: existingReport.title,
+            summary: summary,
+            completedCount: completedCount,
+            skippedCount: skippedCount,
+            failureCount: failureCount,
+            tasks: taskDefinitions
+        )
+    }
+
     private func buildRunReport(
         title: String,
         summary: String,
@@ -1135,6 +1861,163 @@ final class AppViewModel: ObservableObject {
 
     private func playSound(named name: String) {
         NSSound(named: NSSound.Name(name))?.play()
+    }
+
+    private func beginRunTiming(tasks: [MaintenanceTaskDefinition]) {
+        activeRunTasks = tasks
+        runStartedAt = Date()
+        currentTaskStartedAt = nil
+    }
+
+    private func clearRunTiming() {
+        activeRunTasks = []
+        runStartedAt = nil
+        currentTaskStartedAt = nil
+    }
+
+    private func currentTaskDefinition() -> MaintenanceTaskDefinition? {
+        guard let currentTaskID else { return nil }
+        return activeRunTasks.first(where: { $0.id == currentTaskID }) ?? MaintenanceCatalog.task(for: currentTaskID)
+    }
+
+    private func runElapsedSeconds(at now: Date) -> TimeInterval? {
+        guard isRunning, let runStartedAt else { return nil }
+        return max(0, now.timeIntervalSince(runStartedAt))
+    }
+
+    private func currentTaskElapsedSeconds(at now: Date) -> TimeInterval? {
+        guard isRunning, currentTaskID != nil, let currentTaskStartedAt else { return nil }
+        return max(0, now.timeIntervalSince(currentTaskStartedAt))
+    }
+
+    private func runRemainingSeconds(at now: Date) -> TimeInterval? {
+        guard isRunning, !activeRunTasks.isEmpty else { return nil }
+
+        if let currentTaskID,
+           let currentIndex = activeRunTasks.firstIndex(where: { $0.id == currentTaskID }) {
+            let currentTask = activeRunTasks[currentIndex]
+            var remaining = currentTaskRemainingSeconds(at: now) ?? refinedEstimatedDuration(for: currentTask)
+
+            if currentIndex + 1 < activeRunTasks.count {
+                remaining += activeRunTasks[(currentIndex + 1)...].reduce(0) { partial, task in
+                    partial + refinedEstimatedDuration(for: task)
+                }
+            }
+
+            return max(0, remaining)
+        }
+
+        let remainingTasks = activeRunTasks.dropFirst(min(completedTaskCount, activeRunTasks.count))
+        let remaining = remainingTasks.reduce(0) { partial, task in
+            partial + refinedEstimatedDuration(for: task)
+        }
+        return remaining > 0 ? remaining : nil
+    }
+
+    private func currentTaskRemainingSeconds(at now: Date) -> TimeInterval? {
+        guard isRunning,
+              let task = currentTaskDefinition(),
+              let elapsed = currentTaskElapsedSeconds(at: now)
+        else {
+            return nil
+        }
+
+        let expected = adjustedExpectedDuration(for: task, elapsed: elapsed)
+        return max(0, expected - elapsed)
+    }
+
+    private func refinedEstimatedDuration(for task: MaintenanceTaskDefinition) -> TimeInterval {
+        var duration = task.estimatedDuration
+
+        switch task.id {
+        case .malware:
+            let selectedAreas = max(1, selectedComponentsForExecution(for: task).count)
+            duration = max(180, Double(selectedAreas + 1) * 120)
+        case .largeOldFiles, .duplicates, .installerFiles, .downloadsReview, .cloudAudit:
+            let folderFactor = max(1, min(managedFileAccessFolders.count, 4))
+            duration *= Double(folderFactor)
+        default:
+            break
+        }
+
+        return duration
+    }
+
+    private func adjustedExpectedDuration(for task: MaintenanceTaskDefinition, elapsed: TimeInterval) -> TimeInterval {
+        if task.id == .malware,
+           liveTaskExpectedCount > 0,
+           liveTaskProcessedCount > 0 {
+            let fraction = min(max(Double(liveTaskProcessedCount) / Double(liveTaskExpectedCount), 0.01), 0.99)
+            let projectedTotal = elapsed / fraction
+            return max(refinedEstimatedDuration(for: task), projectedTotal)
+        }
+
+        let base = refinedEstimatedDuration(for: task)
+        guard elapsed > 0 else { return base }
+
+        let adaptiveMultiplier: Double
+        switch task.impact {
+        case .light:
+            adaptiveMultiplier = 1.12
+        case .medium:
+            adaptiveMultiplier = 1.16
+        case .high:
+            adaptiveMultiplier = 1.2
+        case .longRunning:
+            adaptiveMultiplier = 1.24
+        }
+
+        if elapsed <= base * 0.82 {
+            return base
+        }
+
+        return max(base, elapsed * adaptiveMultiplier)
+    }
+
+    private func formattedDuration(_ duration: TimeInterval) -> String {
+        let totalSeconds = max(Int(duration.rounded()), 0)
+        let hours = totalSeconds / 3600
+        let minutes = (totalSeconds % 3600) / 60
+        let seconds = totalSeconds % 60
+
+        if hours > 0 {
+            if minutes == 0 {
+                return localized("\(hours)h", "\(hours)u")
+            }
+            return localized("\(hours)h \(minutes)m", "\(hours)u \(minutes)m")
+        }
+
+        if minutes > 0 {
+            if minutes >= 4 || seconds == 0 {
+                return "\(minutes)m"
+            }
+            return "\(minutes)m \(seconds)s"
+        }
+
+        return "\(seconds)s"
+    }
+
+    private func formattedClock(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale.autoupdatingCurrent
+        formatter.timeStyle = .short
+        formatter.dateStyle = .none
+        return formatter.string(from: date)
+    }
+
+    private var currentTaskProgressFraction: Double {
+        guard isRunning, let currentTaskID else { return 0 }
+
+        if currentTaskID == .malware, liveTaskExpectedCount > 0 {
+            return min(max(Double(liveTaskProcessedCount) / Double(liveTaskExpectedCount), 0), 0.99)
+        }
+
+        guard currentTaskStartedAt != nil else { return 0 }
+        let task = currentTaskDefinition() ?? MaintenanceCatalog.task(for: currentTaskID)
+        let elapsed = currentTaskElapsedSeconds(at: Date()) ?? 0
+        let expected = adjustedExpectedDuration(for: task, elapsed: elapsed)
+        guard expected > 0 else { return 0 }
+        return min(max(elapsed / expected, 0), 0.92)
     }
 
     private func ensureInstalledApplicationsLoaded(force: Bool = false) async {
@@ -1244,6 +2127,7 @@ final class AppViewModel: ObservableObject {
         currentRunTitle = ""
         isRunning = false
         isScanningModule = false
+        clearRunTiming()
         lastRunSummary = localized("No maintenance run yet.", "Nog geen onderhoudsrun uitgevoerd.")
         activityEntries = [
             ActivityEntry(
@@ -1351,13 +2235,16 @@ final class AppViewModel: ObservableObject {
         completedTaskCount = completedCount
         totalTaskCount = previewTasks.count
         currentRunTitle = selectedModule.title
+        let now = Date()
         isRunning = true
+        activeRunTasks = previewTasks
+        runStartedAt = now.addingTimeInterval(-88)
+        currentTaskStartedAt = now.addingTimeInterval(-26)
         lastRunSummary = localized(
             "Previous preview run completed without touching the system.",
             "De vorige previewrun is voltooid zonder het systeem aan te raken."
         )
 
-        let now = Date()
         activityEntries = [
             ActivityEntry(
                 timestamp: now,
@@ -1412,6 +2299,157 @@ final class AppViewModel: ObservableObject {
         isShowingDeveloperPanel = true
     }
 
+    private func runDeveloperAutoTour() async {
+        let showcaseModules: [MaintenanceModuleID] = [
+            .smartCare,
+            .cleanup,
+            .protection,
+            .applications,
+            .files,
+            .spaceLens
+        ]
+
+        for (index, moduleID) in showcaseModules.enumerated() {
+            await runDeveloperModuleShowcase(moduleID: moduleID, index: index + 1)
+            guard !Task.isCancelled else { return }
+        }
+
+        await presentDeveloperTourStep(
+            index: 7,
+            title: localized("Update popup", "Updatepopup"),
+            detail: localized(
+                "Showing the in-app update prompt after the tab tour.",
+                "Toont de in-app updateprompt na de tabtour."
+            ),
+            pauseSeconds: 3.0
+        ) { [self] in
+            self.prepareDeveloperUpdateScene()
+        }
+
+        guard !Task.isCancelled else { return }
+
+        await presentDeveloperTourStep(
+            index: 8,
+            title: localized("About", "Over"),
+            detail: localized(
+                "Ending on the About workspace for a calmer final shot.",
+                "Eindigt op de Over-werkruimte voor een rustiger eindshot."
+            ),
+            pauseSeconds: 3.0
+        ) { [self] in
+            self.prepareDeveloperAboutScene()
+        }
+
+        guard !Task.isCancelled else { return }
+
+        developerTourTask = nil
+        finishDeveloperAutoTour(
+            title: localized("Demo complete", "Demo voltooid"),
+            detail: localized(
+                "The automatic preview tour finished. Reopen Preview Tools whenever you want another take.",
+                "De automatische previewtour is afgerond. Open Preview Tools opnieuw wanneer u nog een take wilt maken."
+            )
+        )
+    }
+
+    private func presentDeveloperTourStep(
+        index: Int,
+        title: String,
+        detail: String,
+        pauseSeconds: Double,
+        action: @escaping () -> Void
+    ) async {
+        developerTourStepIndex = index
+        developerTourTitle = title
+        developerTourDetail = detail
+        action()
+        _ = await pauseDeveloperTour(seconds: pauseSeconds)
+    }
+
+    private func pauseDeveloperTour(seconds: Double) async -> Bool {
+        do {
+            try await Task.sleep(for: .seconds(seconds))
+            return !Task.isCancelled
+        } catch {
+            return false
+        }
+    }
+
+    private func waitForDeveloperDemoRun(maximumSeconds: Double) async -> Bool {
+        let deadline = Date().addingTimeInterval(maximumSeconds)
+
+        while Date() < deadline {
+            if Task.isCancelled {
+                return false
+            }
+
+            if !isRunning && lastRunReport != nil {
+                return true
+            }
+
+            do {
+                try await Task.sleep(for: .milliseconds(250))
+            } catch {
+                return false
+            }
+        }
+
+        return true
+    }
+
+    private func finishDeveloperAutoTour(title: String, detail: String) {
+        isPlayingDeveloperTour = false
+        developerTourTitle = ""
+        developerTourDetail = ""
+        developerTourStepIndex = 0
+        developerTourStepCount = 0
+        appendActivity(title: title, detail: detail, isError: false)
+    }
+
+    private func runDeveloperModuleShowcase(moduleID: MaintenanceModuleID, index: Int) async {
+        let module = MaintenanceCatalog.module(for: moduleID)
+        developerTourStepIndex = index
+        developerTourTitle = module.title.appLocalized
+        developerTourDetail = localized(
+            "Showing \(module.title.appLocalized) with safe preview scan results before a short placebo run.",
+            "Toont \(module.title.appLocalized) met veilige previewscanresultaten voordat een korte placeborun start."
+        )
+
+        selectedModuleID = moduleID
+        prepareDeveloperOverviewScene()
+        guard await pauseDeveloperTour(seconds: 2.4), !Task.isCancelled else { return }
+
+        let tasks = developerShowcaseTasks(for: moduleID)
+        guard !tasks.isEmpty else { return }
+
+        dismissRunReport()
+        closeReview(persist: false)
+        closeAbout()
+        developerTourTitle = localized("\(module.title.appLocalized) demo run", "\(module.title.appLocalized)-demorun")
+        developerTourDetail = localized(
+            "Running \(tasks.count) safe preview task(s) on this page so the recording shows real in-app progress and results.",
+            "Voert \(tasks.count) veilige previewtaak/taken uit op deze pagina zodat de opname echte in-app voortgang en resultaten laat zien."
+        )
+
+        await executePlacebo(tasks: tasks, runTitle: module.title)
+        _ = await pauseDeveloperTour(seconds: 2.2)
+    }
+
+    private func developerShowcaseTasks(for moduleID: MaintenanceModuleID) -> [MaintenanceTaskDefinition] {
+        let availableTasks = MaintenanceCatalog.tasks(for: moduleID)
+            .filter { enabledTaskIDs.contains($0.id) }
+
+        let preferredCount: Int
+        switch moduleID {
+        case .spaceLens:
+            preferredCount = 1
+        default:
+            preferredCount = 2
+        }
+
+        return Array(availableTasks.prefix(preferredCount))
+    }
+
     private func executePlacebo(tasks: [MaintenanceTaskDefinition], runTitle: String) async {
         isRunning = true
         currentRunTitle = runTitle
@@ -1419,6 +2457,7 @@ final class AppViewModel: ObservableObject {
         completedTaskCount = 0
         totalTaskCount = tasks.count
         lastRunReport = nil
+        beginRunTiming(tasks: tasks)
 
         for task in tasks {
             taskStates[task.id] = .queued
@@ -1431,6 +2470,7 @@ final class AppViewModel: ObservableObject {
 
         for task in tasks {
             currentTaskID = task.id
+            currentTaskStartedAt = Date()
             taskStates[task.id] = .running
             let currentStep = completedCount + 1
             appendActivity(title: task.title, detail: localized("Working on step \(currentStep) of \(tasks.count).", "Bezig met stap \(currentStep) van \(tasks.count)."), isError: false)
@@ -1449,6 +2489,7 @@ final class AppViewModel: ObservableObject {
         }
 
         currentTaskID = nil
+        currentTaskStartedAt = nil
         isRunning = false
         lastRunSummary = localized("\(runTitle.appLocalized): \(completedCount) completed, 0 skipped, 0 with issues.", "\(runTitle.appLocalized): \(completedCount) voltooid, 0 overgeslagen, 0 met problemen.")
         lastRunReport = buildRunReport(
@@ -1464,6 +2505,7 @@ final class AppViewModel: ObservableObject {
         currentRunTitle = ""
         completedTaskCount = 0
         totalTaskCount = 0
+        clearRunTiming()
     }
 
     private func placeboResult(for task: MaintenanceTaskDefinition) -> CommandExecutionResult {
@@ -1701,7 +2743,7 @@ final class AppViewModel: ObservableObject {
     private func incrementPatchVersion(_ version: String) -> String {
         var parts = version.split(separator: ".").compactMap { Int($0) }
         if parts.isEmpty {
-            return "1.0.12"
+            return "1.0.17"
         }
         if parts.count < 3 {
             parts += Array(repeating: 0, count: 3 - parts.count)
@@ -1757,10 +2799,11 @@ final class AppViewModel: ObservableObject {
     }
 
     private func developerPreviewChangelog() -> String {
-        localized(
-            "What's new\n• Update detection now recognizes release file names such as V1.0.12 and compares the full x.x.x version correctly\n• Automatic update checks now run on launch without the old six-hour wait, so the update popup can surface immediately\n• Newly uploaded releases in the EasyComp download folder should now appear more reliably as in-app update prompts\n• Release notes and packaging were refreshed for the updater reliability pass",
-            "Wat is er nieuw\n• Updatedetectie herkent nu releasebestandsnamen zoals V1.0.12 en vergelijkt de volledige x.x.x-versie correct\n• Automatische updatecontroles draaien nu meteen bij het opstarten zonder de oude wachttijd van zes uur, zodat de updatepopup direct kan verschijnen\n• Nieuw geuploade releases in de EasyComp-downloadmap horen nu betrouwbaarder als in-app updateprompt te verschijnen\n• Release-notes en packaging zijn vernieuwd voor deze updater-betrouwbaarheidspass"
-        )
+        AppReleaseNotes.notes(for: AppBuildFlavor.currentVersion)
+            ?? localized(
+                "What's new\n• A preview update is ready.",
+                "Wat is er nieuw\n• Er staat een preview-update klaar."
+            )
     }
 
     private func developerReviewTarget(for moduleID: MaintenanceModuleID) -> (moduleID: MaintenanceModuleID, taskID: MaintenanceTaskID) {

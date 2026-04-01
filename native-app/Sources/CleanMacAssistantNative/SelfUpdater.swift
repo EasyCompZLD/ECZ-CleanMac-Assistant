@@ -107,6 +107,7 @@ struct AppSelfUpdater {
                 in: mountedVolumeURL,
                 expectedAppName: expectedAppName
             )
+            try verifyAppBundle(at: replacementAppURL)
             let launcherScriptURL = try writeLauncherScript(
                 workingDirectory: workingDirectory,
                 currentAppURL: currentAppURL,
@@ -122,6 +123,7 @@ struct AppSelfUpdater {
                 in: extractedURL,
                 expectedAppName: expectedAppName
             )
+            try verifyAppBundle(at: replacementAppURL)
             let launcherScriptURL = try writeLauncherScript(
                 workingDirectory: workingDirectory,
                 currentAppURL: currentAppURL,
@@ -182,24 +184,23 @@ struct AppSelfUpdater {
         let fileManager = FileManager.default
 
         if let enumerator = fileManager.enumerator(at: rootURL, includingPropertiesForKeys: [.isDirectoryKey]) {
-            var fallbackAppURL: URL?
-
             for case let candidateURL as URL in enumerator {
                 guard candidateURL.pathExtension == "app" else { continue }
 
                 if candidateURL.deletingPathExtension().lastPathComponent == expectedAppName {
                     return candidateURL
                 }
-
-                fallbackAppURL = fallbackAppURL ?? candidateURL
-            }
-
-            if let fallbackAppURL {
-                return fallbackAppURL
             }
         }
 
         throw SelfUpdateError.appBundleMissing
+    }
+
+    private func verifyAppBundle(at appURL: URL) throws {
+        _ = try runTool(
+            "/usr/bin/codesign",
+            arguments: ["--verify", "--deep", "--strict", appURL.path]
+        )
     }
 
     private func writeLauncherScript(

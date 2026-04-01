@@ -1,7 +1,7 @@
 import Foundation
 
 enum AppBuildFlavor {
-    static let currentVersion = "1.0.12"
+    static let currentVersion = "1.0.21"
 
     #if DEVELOPER_BUILD
     static let isDeveloper = true
@@ -18,4 +18,13 @@ enum AppBuildFlavor {
             ? localized("Developer build", "Ontwikkelbuild")
             : localized("Release build", "Releasebuild")
     }
+
+    static var expectedArtifactKind: ArtifactKind {
+        isDeveloper ? .developer : .release
+    }
+}
+
+enum ArtifactKind {
+    case release
+    case developer
 }

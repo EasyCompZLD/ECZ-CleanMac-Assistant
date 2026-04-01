@@ -8,6 +8,11 @@ enum CleanupAction: Equatable {
     case sqlite(databasePath: String, statement: String)
 }
 
+enum TaskScanComponentRole: Equatable {
+    case cleanup
+    case scanTarget
+}
+
 struct TaskScanComponent: Identifiable, Equatable {
     let id: String
     let title: String
@@ -16,6 +21,30 @@ struct TaskScanComponent: Identifiable, Equatable {
     let itemCount: Int?
     let selectedByDefault: Bool
     let cleanupAction: CleanupAction?
+    let role: TaskScanComponentRole
+    let executionPaths: [String]
+
+    init(
+        id: String,
+        title: String,
+        detail: String,
+        reclaimableBytes: Int64?,
+        itemCount: Int?,
+        selectedByDefault: Bool,
+        cleanupAction: CleanupAction?,
+        role: TaskScanComponentRole = .cleanup,
+        executionPaths: [String] = []
+    ) {
+        self.id = id
+        self.title = title
+        self.detail = detail
+        self.reclaimableBytes = reclaimableBytes
+        self.itemCount = itemCount
+        self.selectedByDefault = selectedByDefault
+        self.cleanupAction = cleanupAction
+        self.role = role
+        self.executionPaths = executionPaths
+    }
 
     var countLabel: String? {
         guard let itemCount else { return nil }
@@ -326,7 +355,7 @@ actor MaintenanceScanner {
         case .update, .brew, .activityMonitor, .loginItems, .appStoreUpdates:
             return .unavailable("This task opens or updates something, so there is nothing to remove beforehand.")
         case .malware:
-            return .unavailable("This task does a full safety scan first when you run it.")
+            return malwareScanReview()
         case .uninstall, .reset:
             return .unavailable("This task depends on the app or settings you choose, so there is no fixed preview yet.")
         case .orphanedFiles:
@@ -398,8 +427,8 @@ actor MaintenanceScanner {
     private func launchAgentsReview() -> TaskScanState {
         let folder = home("Library/LaunchAgents")
         guard fileManager.fileExists(atPath: folder.path) else {
-        return .ready(TaskScanFinding(message: "No LaunchAgents were found in your user Library.", reclaimableBytes: 0, itemCount: 0, components: []))
-    }
+            return .ready(TaskScanFinding(message: "No LaunchAgents were found in your user Library.", reclaimableBytes: 0, itemCount: 0, components: []))
+        }
 
         let urls = (try? fileManager.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.fileSizeKey], options: [.skipsHiddenFiles])) ?? []
         let components = urls.map { url in
@@ -415,6 +444,97 @@ actor MaintenanceScanner {
         }
 
         return reviewState(components: components, emptyMessage: "No LaunchAgents were found in your user Library.")
+    }
+
+    private func malwareScanReview() -> TaskScanState {
+        let groups: [(id: String, title: String, detail: String, selectedByDefault: Bool, paths: [URL])] = [
+            (
+                id: "malware_apps",
+                title: localized("Applications", "Apps"),
+                detail: localized(
+                    "Scan installed apps and common app containers for known malware signatures.",
+                    "Scan geïnstalleerde apps en veelvoorkomende appcontainers op bekende malware-signatures."
+                ),
+                selectedByDefault: true,
+                paths: [URL(fileURLWithPath: "/Applications"), home("Applications")]
+            ),
+            (
+                id: "malware_startup",
+                title: localized("Startup items", "Opstartonderdelen"),
+                detail: localized(
+                    "Check LaunchAgents, LaunchDaemons, and other startup points that malware often abuses.",
+                    "Controleer LaunchAgents, LaunchDaemons en andere opstartpunten die malware vaak misbruikt."
+                ),
+                selectedByDefault: true,
+                paths: [
+                    URL(fileURLWithPath: "/Library/LaunchAgents"),
+                    URL(fileURLWithPath: "/Library/LaunchDaemons"),
+                    home("Library/LaunchAgents")
+                ]
+            ),
+            (
+                id: "malware_home_support",
+                title: localized("Library support files", "Bibliotheek-ondersteuning"),
+                detail: localized(
+                    "Inspect user Library support, preferences, and helper files where persistence often hides.",
+                    "Inspecteer ondersteuningsbestanden, voorkeuren en helperbestanden in de gebruikersbibliotheek waar persistentie zich vaak verstopt."
+                ),
+                selectedByDefault: true,
+                paths: [
+                    home("Library/Application Support"),
+                    home("Library/Preferences")
+                ]
+            ),
+            (
+                id: "malware_downloads_desktop",
+                title: localized("Downloads and Desktop", "Downloads en Bureaublad"),
+                detail: localized(
+                    "Check the places where suspicious downloads and unpacked payloads often land first.",
+                    "Controleer de plekken waar verdachte downloads en uitgepakte payloads vaak als eerste terechtkomen."
+                ),
+                selectedByDefault: true,
+                paths: [home("Downloads"), home("Desktop")]
+            ),
+            (
+                id: "malware_documents",
+                title: localized("Documents", "Documenten"),
+                detail: localized(
+                    "Optionally include your Documents folder if you want broader coverage for manually stored files.",
+                    "Neem desgewenst ook uw map Documenten mee als u bredere dekking wilt voor handmatig opgeslagen bestanden."
+                ),
+                selectedByDefault: false,
+                paths: [home("Documents")]
+            )
+        ]
+
+        let components = groups.compactMap { group -> TaskScanComponent? in
+            let existingPaths = group.paths.filter { fileManager.fileExists(atPath: $0.path) }
+            guard !existingPaths.isEmpty else { return nil }
+
+            return TaskScanComponent(
+                id: group.id,
+                title: group.title,
+                detail: group.detail,
+                reclaimableBytes: nil,
+                itemCount: existingPaths.count,
+                selectedByDefault: group.selectedByDefault,
+                cleanupAction: nil,
+                role: .scanTarget,
+                executionPaths: existingPaths.map(\.path)
+            )
+        }
+
+        return .ready(
+            TaskScanFinding(
+                message: localized(
+                    "Choose the areas you want ClamAV to inspect. The scan itself does not delete anything; if threats are found, you decide what happens next.",
+                    "Kies welke gebieden ClamAV moet controleren. De scan zelf verwijdert niets; als er dreigingen worden gevonden, bepaalt u daarna wat ermee gebeurt."
+                ),
+                reclaimableBytes: nil,
+                itemCount: components.count,
+                components: components
+            )
+        )
     }
 
     private func largeOldFilesReview() -> TaskScanState {

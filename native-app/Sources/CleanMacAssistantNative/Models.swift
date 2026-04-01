@@ -1,5 +1,69 @@
 import SwiftUI
 
+enum MaintenanceProgressNotification {
+    static let name = Notification.Name("MaintenanceProgressDidUpdate")
+    static let taskIDKey = "taskID"
+    static let lineKey = "line"
+}
+
+enum MalwareThreatActionChoice: String, CaseIterable, Identifiable {
+    case ignore
+    case quarantine
+    case delete
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .ignore:
+            return localized("Ignore", "Negeren")
+        case .quarantine:
+            return localized("Quarantine", "Quarantaine")
+        case .delete:
+            return localized("Delete", "Verwijderen")
+        }
+    }
+}
+
+enum MalwareThreatResolution: Equatable {
+    case pending
+    case ignored
+    case quarantined(destination: String)
+    case deleted
+    case failed(message: String)
+
+    var badgeText: String {
+        switch self {
+        case .pending:
+            return localized("Pending", "Wachtend")
+        case .ignored:
+            return localized("Ignored", "Genegeerd")
+        case .quarantined:
+            return localized("Quarantined", "In quarantaine")
+        case .deleted:
+            return localized("Deleted", "Verwijderd")
+        case .failed:
+            return localized("Issue", "Probleem")
+        }
+    }
+}
+
+struct MalwareThreat: Identifiable, Equatable {
+    let id: String
+    let path: String
+    let signature: String
+
+    var fileName: String {
+        URL(fileURLWithPath: path).lastPathComponent
+    }
+}
+
+struct MalwareScanOutcome: Equatable {
+    let threats: [MalwareThreat]
+    let targetTitles: [String]
+    let checkedFileCount: Int?
+}
+
 enum MaintenanceModuleID: String, CaseIterable, Identifiable {
     case smartCare
     case cleanup
@@ -205,6 +269,103 @@ struct MaintenanceTaskDefinition: Identifiable {
     let confirmation: TaskConfirmation?
 }
 
+extension MaintenanceTaskDefinition {
+    var estimatedDuration: TimeInterval {
+        switch id {
+        case .checkDependencies:
+            return 50
+        case .trash:
+            return 18
+        case .cache:
+            return 25
+        case .logs:
+            return 15
+        case .localizations:
+            return 45
+        case .chrome:
+            return 18
+        case .firefox:
+            return 18
+        case .mailAttachments:
+            return 24
+        case .ram:
+            return 12
+        case .scripts:
+            return 28
+        case .dns:
+            return 10
+        case .restart:
+            return 15
+        case .update:
+            return 110
+        case .brew:
+            return 90
+        case .activityMonitor:
+            return 5
+        case .loginItems:
+            return 8
+        case .safari:
+            return 18
+        case .imessage:
+            return 20
+        case .cookies:
+            return 10
+        case .facetime:
+            return 8
+        case .malware:
+            return 540
+        case .agents:
+            return 15
+        case .uninstall:
+            return 24
+        case .orphanedFiles:
+            return 90
+        case .reset:
+            return 12
+        case .appStoreUpdates:
+            return 5
+        case .disk:
+            return 5
+        case .largeOldFiles:
+            return 100
+        case .duplicates:
+            return 210
+        case .installerFiles:
+            return 50
+        case .downloadsReview:
+            return 45
+        case .cloudAudit:
+            return 25
+        }
+    }
+
+    var estimatedDurationLabel: String {
+        let seconds = Int(estimatedDuration.rounded())
+
+        if seconds < 60 {
+            return localized("About \(seconds)s", "Ongeveer \(seconds)s")
+        }
+
+        let minutes = seconds / 60
+        let remainingSeconds = seconds % 60
+
+        if minutes >= 60 {
+            let hours = minutes / 60
+            let remainingMinutes = minutes % 60
+            if remainingMinutes == 0 {
+                return localized("About \(hours)h", "Ongeveer \(hours)u")
+            }
+            return localized("About \(hours)h \(remainingMinutes)m", "Ongeveer \(hours)u \(remainingMinutes)m")
+        }
+
+        if remainingSeconds == 0 || minutes >= 4 {
+            return localized("About \(minutes)m", "Ongeveer \(minutes)m")
+        }
+
+        return localized("About \(minutes)m \(remainingSeconds)s", "Ongeveer \(minutes)m \(remainingSeconds)s")
+    }
+}
+
 struct ActivityEntry: Identifiable {
     let id = UUID()
     let timestamp: Date
@@ -238,7 +399,7 @@ enum MaintenanceCatalog {
             id: .smartCare,
             eyebrow: "Overview and smart scan",
             title: "Home",
-            subtitle: "Start here with a calmer smart scan, quick health context, and the main cleanup lanes for this Mac.",
+            subtitle: "Start here with a lighter first pass, quick health context, and the main maintenance lanes for this Mac.",
             symbolName: "sparkles",
             theme: ModuleTheme(
                 top: Color(red: 0.12, green: 0.25, blue: 0.46),
@@ -308,7 +469,7 @@ enum MaintenanceCatalog {
             id: .files,
             eyebrow: "Duplicates and files",
             title: "Files",
-            subtitle: "Review duplicate files, large and older files, installer packages, and the Downloads folder from one place.",
+            subtitle: "Review duplicate files, large and older files, installer packages, and manual file cleanup from one place.",
             symbolName: "doc.on.doc.fill",
             theme: ModuleTheme(
                 top: Color(red: 0.34, green: 0.23, blue: 0.31),
@@ -756,7 +917,7 @@ enum MaintenanceCatalog {
             moduleID: .files,
             title: "Scan Large & Old Files",
             subtitle: "Review and remove bulky or stale files inside the app.",
-            detail: "Scans Desktop, Documents, and Downloads for large or stale files and lets you choose exactly which ones to remove.",
+            detail: "Scans the folders you connected in Files for large or stale files and lets you choose exactly which ones to remove.",
             symbolName: "archivebox.fill",
             impact: .medium,
             estimatedTime: "A few seconds to a minute",
@@ -769,7 +930,7 @@ enum MaintenanceCatalog {
             moduleID: .files,
             title: "Scan Duplicate Files",
             subtitle: "Review duplicate copies and keep one original inside the app.",
-            detail: "Scans for duplicate files in Desktop, Documents, and Downloads, keeps one suggested original per group, and lets you remove the extra copies.",
+            detail: "Scans the folders you connected in Files for duplicate files, keeps one suggested original per group, and lets you remove the extra copies.",
             symbolName: "square.on.square.fill",
             impact: .longRunning,
             estimatedTime: "Can take a while on larger folders",
@@ -782,7 +943,7 @@ enum MaintenanceCatalog {
             moduleID: .files,
             title: "Clean Installer Files",
             subtitle: "Review and remove old installer packages inside the app.",
-            detail: "Scans Downloads, Desktop, and Homebrew cache locations for older installer packages such as DMG, PKG, and XIP files, then lets you remove only the ones you select.",
+            detail: "Scans your connected folders and the Homebrew cache for older installer packages such as DMG, PKG, and XIP files, then lets you remove only the ones you select.",
             symbolName: "shippingbox.and.arrow.backward.fill",
             impact: .medium,
             estimatedTime: "A few seconds",

@@ -422,6 +422,7 @@ private struct SidebarPane: View {
                 ) {
                     viewModel.toggleDeveloperPanel()
                 }
+                .keyboardShortcut("m", modifiers: [.command])
                 #endif
             }
         }
@@ -720,7 +721,7 @@ private struct ModuleDetailPane: View {
 
                                     Button(localized("Scan this page", "Deze pagina scannen")) {
                                         Task {
-                                            await viewModel.scanCurrentModule()
+                                            await viewModel.scanCurrentModule(force: true)
                                         }
                                     }
                                     .buttonStyle(SecondaryGlassButtonStyle())
@@ -730,6 +731,10 @@ private struct ModuleDetailPane: View {
 
                         if module.id == .files {
                             FileAccessPanel(tint: module.theme.accent)
+                        }
+
+                        if viewModel.hasSelectedModuleTaskResults && !viewModel.isRunning {
+                            ModuleResultsOverview(module: module)
                         }
 
                         LazyVStack(spacing: 16) {
@@ -807,6 +812,7 @@ private struct ModuleDetailPane: View {
                     .padding(24)
                     .transition(.opacity.combined(with: .scale(scale: 0.98)))
             }
+
         }
         .animation(.spring(response: 0.42, dampingFraction: 0.88), value: viewModel.reviewTaskID)
         .animation(.easeInOut(duration: 0.28), value: viewModel.isRunning)
@@ -1239,7 +1245,7 @@ private struct HomeDashboardView: View {
 
                 Button {
                     Task {
-                        await viewModel.scanCurrentModule()
+                        await viewModel.scanCurrentModule(force: true)
                     }
                 } label: {
                     Label(localized("Analyze First", "Eerst analyseren"), systemImage: "magnifyingglass")
@@ -1727,11 +1733,15 @@ private struct RunExperienceOverlay: View {
     @State private var progressGlow = false
 
     private var progressPercent: Int {
-        Int(viewModel.runProgressFraction * 100)
+        viewModel.visibleProgressPercent
     }
 
     private var recentEntries: [ActivityEntry] {
         Array(viewModel.activityEntries.prefix(3))
+    }
+
+    private var liveLines: [String] {
+        Array(viewModel.liveTaskRecentLines.prefix(4))
     }
 
     var body: some View {
@@ -1767,203 +1777,272 @@ private struct RunExperienceOverlay: View {
                 .blur(radius: 70)
                 .offset(x: -140, y: 120)
 
-            VStack(alignment: .leading, spacing: 28) {
-                HStack(alignment: .top) {
-                    VStack(alignment: .leading, spacing: 10) {
-                        Text(localized("Working", "Bezig"))
-                            .font(.system(size: 12, weight: .bold, design: .rounded))
-                            .kerning(1.4)
-                            .foregroundStyle(module.theme.mist.opacity(0.92))
-                            .textCase(.uppercase)
+            TimelineView(.periodic(from: .now, by: 1)) { context in
+                let elapsedChip = viewModel.runElapsedChipText(at: context.date)
+                let etaChip = viewModel.runRemainingChipText(at: context.date)
+                let finishChip = viewModel.runCompletionTimeChipText(at: context.date)
+                let currentTimingDetail = viewModel.currentTaskTimingDetail(at: context.date)
 
-                        Text(viewModel.runProgressTitle)
-                            .font(.system(size: 42, weight: .bold, design: .rounded))
-                            .foregroundStyle(AppPalette.textPrimary)
+                VStack(alignment: .leading, spacing: 28) {
+                    HStack(alignment: .top) {
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text(localized("Working", "Bezig"))
+                                .font(.system(size: 12, weight: .bold, design: .rounded))
+                                .kerning(1.4)
+                                .foregroundStyle(module.theme.mist.opacity(0.92))
+                                .textCase(.uppercase)
 
-                        Text(viewModel.runProgressDetail)
-                            .font(.system(size: 16, weight: .medium))
-                            .foregroundStyle(AppPalette.textSecondary)
-                    }
+                            Text(viewModel.runProgressTitle)
+                                .font(.system(size: 42, weight: .bold, design: .rounded))
+                                .foregroundStyle(AppPalette.textPrimary)
 
-                    Spacer(minLength: 24)
-
-                    VStack(alignment: .trailing, spacing: 14) {
-                        #if DEVELOPER_BUILD
-                        if viewModel.isPlaceboModeActive {
-                            Button("Preview Tools") {
-                                viewModel.reopenDeveloperPanel()
-                            }
-                            .buttonStyle(SecondaryGlassButtonStyle())
+                            Text(viewModel.runProgressDetail)
+                                .font(.system(size: 16, weight: .medium))
+                                .foregroundStyle(AppPalette.textSecondary)
                         }
-                        #endif
 
-                        ZStack {
-                            Circle()
-                                .stroke(Color.white.opacity(0.10), lineWidth: 16)
-                                .frame(width: 154, height: 154)
+                        Spacer(minLength: 24)
 
-                            Circle()
-                                .trim(from: 0, to: max(viewModel.runProgressFraction, 0.04))
-                                .stroke(
-                                    AngularGradient(
-                                        colors: [AppPalette.iceBlue, tint, AppPalette.pinkGlow],
-                                        center: .center
-                                    ),
-                                    style: StrokeStyle(lineWidth: 16, lineCap: .round)
-                                )
-                                .frame(width: 154, height: 154)
-                                .rotationEffect(.degrees(-90))
-
-                            Circle()
-                                .stroke(tint.opacity(0.22), lineWidth: 1)
-                                .frame(width: 168, height: 168)
-
-                            Circle()
-                                .fill(tint.opacity(progressGlow ? 0.22 : 0.12))
-                                .frame(width: 86, height: 86)
-                                .blur(radius: progressGlow ? 24 : 14)
-
-                            VStack(spacing: 6) {
-                                Text("\(progressPercent)%")
-                                    .font(.system(size: 34, weight: .bold, design: .rounded))
-                                    .foregroundStyle(AppPalette.textPrimary)
-                                Text(localized("done", "klaar"))
-                                    .font(.system(size: 12, weight: .semibold))
-                                    .foregroundStyle(AppPalette.textTertiary)
-                            }
-                        }
-                    }
-                }
-
-                VStack(alignment: .leading, spacing: 12) {
-                    HStack {
-                        Text(localized("Live progress", "Live voortgang"))
-                            .font(.system(size: 14, weight: .bold, design: .rounded))
-                            .foregroundStyle(AppPalette.textPrimary)
-
-                        Spacer()
-
-                        Text(localized("\(viewModel.completedTaskCount) / \(max(viewModel.totalTaskCount, 1)) steps", "\(viewModel.completedTaskCount) / \(max(viewModel.totalTaskCount, 1)) stappen"))
-                            .font(.system(size: 12, weight: .semibold))
-                            .foregroundStyle(AppPalette.textTertiary)
-                    }
-
-                    GeometryReader { proxy in
-                        let filledWidth = max(proxy.size.width * max(viewModel.runProgressFraction, 0.02), 18)
-
-                        ZStack(alignment: .leading) {
-                            Capsule()
-                                .fill(Color.white.opacity(0.07))
-
-                            Capsule()
-                                .fill(
-                                    LinearGradient(
-                                        colors: [AppPalette.iceBlue, tint, AppPalette.pinkGlow],
-                                        startPoint: .leading,
-                                        endPoint: .trailing
-                                    )
-                                )
-                                .frame(width: filledWidth)
-                                .shadow(color: tint.opacity(progressGlow ? 0.42 : 0.22), radius: progressGlow ? 16 : 10)
-                                .overlay {
-                                    Capsule()
-                                        .fill(
-                                            LinearGradient(
-                                                colors: [
-                                                    .clear,
-                                                    Color.white.opacity(progressGlow ? 0.08 : 0.0),
-                                                    Color.white.opacity(progressGlow ? 0.42 : 0.14),
-                                                    .clear
-                                                ],
-                                                startPoint: .leading,
-                                                endPoint: .trailing
-                                            )
-                                        )
-                                        .frame(width: min(140, filledWidth))
-                                        .offset(x: progressGlow ? max(filledWidth - 110, 0) : 0)
+                        VStack(alignment: .trailing, spacing: 14) {
+                            #if DEVELOPER_BUILD
+                            if viewModel.isPlaceboModeActive {
+                                Button("Preview Tools") {
+                                    viewModel.reopenDeveloperPanel()
                                 }
-                                .overlay(alignment: .trailing) {
-                                    ZStack {
-                                        Circle()
-                                            .fill(Color.white.opacity(progressGlow ? 0.56 : 0.26))
-                                            .frame(width: 28, height: 28)
-                                            .blur(radius: progressGlow ? 12 : 6)
+                                .buttonStyle(SecondaryGlassButtonStyle())
+                            }
+                            #endif
 
-                                        Circle()
-                                            .fill(Color.white.opacity(0.94))
-                                            .frame(width: 12, height: 12)
-                                    }
-                                    .offset(x: -2)
-                                }
-                        }
-                    }
-                    .frame(height: 18)
-                }
-
-                HStack(spacing: 10) {
-                    progressChip(text: module.title.appLocalized, tint: tint)
-                    progressChip(
-                        text: localized(
-                            "\(viewModel.completedTaskCount) / \(max(viewModel.totalTaskCount, 1)) steps",
-                            "\(viewModel.completedTaskCount) / \(max(viewModel.totalTaskCount, 1)) stappen"
-                        ),
-                        tint: AppPalette.iceBlue
-                    )
-                    progressChip(text: localized("Stay open", "Blijft open"), tint: AppPalette.pinkGlow)
-                }
-
-                VStack(alignment: .leading, spacing: 14) {
-                    HStack {
-                        Text(localized("Recent", "Recent"))
-                            .font(.system(size: 24, weight: .bold, design: .rounded))
-                            .foregroundStyle(AppPalette.textPrimary)
-
-                        Spacer()
-                    }
-
-                    VStack(spacing: 10) {
-                        ForEach(recentEntries) { entry in
-                            HStack(alignment: .top, spacing: 12) {
+                            ZStack {
                                 Circle()
-                                    .fill(entry.isError ? AppPalette.error : tint)
-                                    .frame(width: 10, height: 10)
-                                    .padding(.top, 5)
+                                    .stroke(Color.white.opacity(0.10), lineWidth: 16)
+                                    .frame(width: 154, height: 154)
 
-                                VStack(alignment: .leading, spacing: 5) {
-                                    HStack {
-                                        Text(entry.title)
-                                            .font(.system(size: 14, weight: .bold, design: .rounded))
-                                            .foregroundStyle(AppPalette.textPrimary)
+                                Circle()
+                                    .trim(from: 0, to: max(viewModel.visibleProgressFraction, 0.04))
+                                    .stroke(
+                                        AngularGradient(
+                                            colors: [AppPalette.iceBlue, tint, AppPalette.pinkGlow],
+                                            center: .center
+                                        ),
+                                        style: StrokeStyle(lineWidth: 16, lineCap: .round)
+                                    )
+                                    .frame(width: 154, height: 154)
+                                    .rotationEffect(.degrees(-90))
 
-                                        Spacer()
+                                Circle()
+                                    .stroke(tint.opacity(0.22), lineWidth: 1)
+                                    .frame(width: 168, height: 168)
 
-                                        Text(entry.timestamp.formatted(date: .omitted, time: .standard))
-                                            .font(.system(size: 11, weight: .medium, design: .monospaced))
-                                            .foregroundStyle(AppPalette.textTertiary)
-                                    }
+                                Circle()
+                                    .fill(tint.opacity(progressGlow ? 0.22 : 0.12))
+                                    .frame(width: 86, height: 86)
+                                    .blur(radius: progressGlow ? 24 : 14)
 
-                                    Text(entry.detail)
-                                        .font(.system(size: 12, weight: .medium))
-                                        .foregroundStyle(entry.isError ? AppPalette.error.opacity(0.94) : AppPalette.textSecondary)
-                                        .lineLimit(3)
-                                        .fixedSize(horizontal: false, vertical: true)
+                                VStack(spacing: 6) {
+                                    Text("\(progressPercent)%")
+                                        .font(.system(size: 34, weight: .bold, design: .rounded))
+                                        .foregroundStyle(AppPalette.textPrimary)
+                                    Text(viewModel.visibleProgressCaption)
+                                        .font(.system(size: 12, weight: .semibold))
+                                        .foregroundStyle(AppPalette.textTertiary)
                                 }
                             }
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(16)
-                            .background(
-                                RoundedRectangle(cornerRadius: 22, style: .continuous)
-                                    .fill(Color.white.opacity(0.05))
-                                    .overlay(
-                                        RoundedRectangle(cornerRadius: 22, style: .continuous)
-                                            .stroke(Color.white.opacity(0.07), lineWidth: 1)
+                        }
+                    }
+
+                    VStack(alignment: .leading, spacing: 12) {
+                        HStack {
+                            Text(viewModel.visibleProgressSectionTitle)
+                                .font(.system(size: 14, weight: .bold, design: .rounded))
+                                .foregroundStyle(AppPalette.textPrimary)
+
+                            Spacer()
+
+                            Text(localized("\(viewModel.completedTaskCount) / \(max(viewModel.totalTaskCount, 1)) steps", "\(viewModel.completedTaskCount) / \(max(viewModel.totalTaskCount, 1)) stappen"))
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundStyle(AppPalette.textTertiary)
+                        }
+
+                        GeometryReader { proxy in
+                            let filledWidth = max(proxy.size.width * max(viewModel.visibleProgressFraction, 0.02), 18)
+
+                            ZStack(alignment: .leading) {
+                                Capsule()
+                                    .fill(Color.white.opacity(0.07))
+
+                                Capsule()
+                                    .fill(
+                                        LinearGradient(
+                                            colors: [AppPalette.iceBlue, tint, AppPalette.pinkGlow],
+                                            startPoint: .leading,
+                                            endPoint: .trailing
+                                        )
                                     )
+                                    .frame(width: filledWidth)
+                                    .shadow(color: tint.opacity(progressGlow ? 0.42 : 0.22), radius: progressGlow ? 16 : 10)
+                                    .overlay {
+                                        Capsule()
+                                            .fill(
+                                                LinearGradient(
+                                                    colors: [
+                                                        .clear,
+                                                        Color.white.opacity(progressGlow ? 0.08 : 0.0),
+                                                        Color.white.opacity(progressGlow ? 0.42 : 0.14),
+                                                        .clear
+                                                    ],
+                                                    startPoint: .leading,
+                                                    endPoint: .trailing
+                                                )
+                                            )
+                                            .frame(width: min(140, filledWidth))
+                                            .offset(x: progressGlow ? max(filledWidth - 110, 0) : 0)
+                                    }
+                                    .overlay(alignment: .trailing) {
+                                        ZStack {
+                                            Circle()
+                                                .fill(Color.white.opacity(progressGlow ? 0.56 : 0.26))
+                                                .frame(width: 28, height: 28)
+                                                .blur(radius: progressGlow ? 12 : 6)
+
+                                            Circle()
+                                                .fill(Color.white.opacity(0.94))
+                                                .frame(width: 12, height: 12)
+                                        }
+                                        .offset(x: -2)
+                                    }
+                            }
+                        }
+                        .frame(height: 18)
+                    }
+
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 10) {
+                            progressChip(text: module.title.appLocalized, tint: tint)
+                            progressChip(
+                                text: localized(
+                                    "\(viewModel.completedTaskCount) / \(max(viewModel.totalTaskCount, 1)) steps",
+                                    "\(viewModel.completedTaskCount) / \(max(viewModel.totalTaskCount, 1)) stappen"
+                                ),
+                                tint: AppPalette.iceBlue
+                            )
+                            if let elapsedChip {
+                                progressChip(text: elapsedChip, tint: AppPalette.violetGlow)
+                            }
+                            if let etaChip {
+                                progressChip(text: etaChip, tint: AppPalette.pinkGlow)
+                            }
+                            if let finishChip {
+                                progressChip(text: finishChip, tint: AppPalette.success)
+                            }
+                        }
+                        .padding(.vertical, 1)
+                    }
+
+                    if viewModel.hasLiveTaskProgress {
+                        HStack(spacing: 14) {
+                            liveStatusCard(
+                                title: localized("Now scanning", "Nu bezig met"),
+                                value: viewModel.liveTaskCurrentItemLabel ?? localized("Preparing focused scan areas...", "Gerichte scanlocaties worden voorbereid..."),
+                                tint: tint,
+                                secondary: viewModel.runProgressDetail
+                            )
+
+                            liveStatusCard(
+                                title: localized("Checked so far", "Tot nu toe gecontroleerd"),
+                                value: viewModel.liveTaskProcessedCountLabel ?? localized("Starting up", "Starten"),
+                                tint: AppPalette.iceBlue,
+                                secondary: currentTimingDetail
+                            )
+
+                            liveStatusCard(
+                                title: localized("Possible threats", "Mogelijke dreigingen"),
+                                value: viewModel.liveThreatStatusValue,
+                                tint: viewModel.liveThreatCount > 0 ? AppPalette.error : AppPalette.success,
+                                secondary: viewModel.liveThreatStatusDetail
                             )
                         }
                     }
+
+                    VStack(alignment: .leading, spacing: 14) {
+                        HStack {
+                            Text(viewModel.liveTaskSectionTitle)
+                                .font(.system(size: 24, weight: .bold, design: .rounded))
+                                .foregroundStyle(AppPalette.textPrimary)
+
+                            Spacer()
+                        }
+
+                        VStack(spacing: 10) {
+                            if liveLines.isEmpty {
+                                ForEach(recentEntries) { entry in
+                                    HStack(alignment: .top, spacing: 12) {
+                                        Circle()
+                                            .fill(entry.isError ? AppPalette.error : tint)
+                                            .frame(width: 10, height: 10)
+                                            .padding(.top, 5)
+
+                                        VStack(alignment: .leading, spacing: 5) {
+                                            HStack {
+                                                Text(entry.title)
+                                                    .font(.system(size: 14, weight: .bold, design: .rounded))
+                                                    .foregroundStyle(AppPalette.textPrimary)
+
+                                                Spacer()
+
+                                                Text(entry.timestamp.formatted(date: .omitted, time: .standard))
+                                                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+                                                    .foregroundStyle(AppPalette.textTertiary)
+                                            }
+
+                                            Text(entry.detail)
+                                                .font(.system(size: 12, weight: .medium))
+                                                .foregroundStyle(entry.isError ? AppPalette.error.opacity(0.94) : AppPalette.textSecondary)
+                                                .lineLimit(3)
+                                                .fixedSize(horizontal: false, vertical: true)
+                                        }
+                                    }
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .padding(16)
+                                    .background(
+                                        RoundedRectangle(cornerRadius: 22, style: .continuous)
+                                            .fill(Color.white.opacity(0.05))
+                                            .overlay(
+                                                RoundedRectangle(cornerRadius: 22, style: .continuous)
+                                                    .stroke(Color.white.opacity(0.07), lineWidth: 1)
+                                            )
+                                    )
+                                }
+                            } else {
+                                ForEach(Array(liveLines.enumerated()), id: \.offset) { _, line in
+                                    HStack(alignment: .top, spacing: 12) {
+                                        Circle()
+                                            .fill(line.localizedCaseInsensitiveContains("FOUND") ? AppPalette.error : tint)
+                                            .frame(width: 10, height: 10)
+                                            .padding(.top, 5)
+
+                                        Text(line)
+                                            .font(.system(size: 12, weight: .medium, design: .monospaced))
+                                            .foregroundStyle(AppPalette.textSecondary)
+                                            .lineLimit(2)
+                                            .frame(maxWidth: .infinity, alignment: .leading)
+                                    }
+                                    .padding(16)
+                                    .background(
+                                        RoundedRectangle(cornerRadius: 22, style: .continuous)
+                                            .fill(Color.white.opacity(0.05))
+                                            .overlay(
+                                                RoundedRectangle(cornerRadius: 22, style: .continuous)
+                                                    .stroke(Color.white.opacity(0.07), lineWidth: 1)
+                                            )
+                                    )
+                                }
+                            }
+                        }
+                    }
                 }
+                .padding(32)
             }
-            .padding(32)
         }
         .shadow(color: tint.opacity(0.22), radius: 36, y: 20)
         .onAppear {
@@ -1988,6 +2067,37 @@ private struct RunExperienceOverlay: View {
                     )
             )
     }
+
+    private func liveStatusCard(title: String, value: String, tint: Color, secondary: String) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title)
+                .font(.system(size: 11, weight: .bold, design: .rounded))
+                .kerning(1.1)
+                .foregroundStyle(tint.opacity(0.92))
+                .textCase(.uppercase)
+
+            Text(value)
+                .font(.system(size: 15, weight: .bold, design: .rounded))
+                .foregroundStyle(AppPalette.textPrimary)
+                .lineLimit(2)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            Text(secondary)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(AppPalette.textTertiary)
+                .lineLimit(2)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(18)
+        .background(
+            RoundedRectangle(cornerRadius: 24, style: .continuous)
+                .fill(Color.white.opacity(0.055))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 24, style: .continuous)
+                        .stroke(tint.opacity(0.14), lineWidth: 1)
+                )
+        )
+    }
 }
 
 private struct RunCompletionWorkspace: View {
@@ -1997,6 +2107,33 @@ private struct RunCompletionWorkspace: View {
 
     private var tint: Color {
         report.failureCount > 0 ? AppPalette.error : module.theme.accent
+    }
+
+    private var issueTasks: [RunTaskReport] {
+        report.tasks.filter {
+            if case .failed = $0.state {
+                return true
+            }
+            return false
+        }
+    }
+
+    private var completedTasks: [RunTaskReport] {
+        report.tasks.filter {
+            if case .succeeded = $0.state {
+                return true
+            }
+            return false
+        }
+    }
+
+    private var skippedTasks: [RunTaskReport] {
+        report.tasks.filter {
+            if case .skipped = $0.state {
+                return true
+            }
+            return false
+        }
     }
 
     var body: some View {
@@ -2058,6 +2195,10 @@ private struct RunCompletionWorkspace: View {
                         )
                     }
 
+                    if viewModel.hasMalwareThreatsInLatestRun {
+                        MalwareThreatActionWorkspace(tint: tint)
+                    }
+
                     if report.failureCount > 0 {
                         Text(localized("A few items need attention. Open the details below for the exact reason.", "Een paar onderdelen vragen aandacht. Open hieronder de details voor de exacte reden."))
                             .font(.system(size: 13, weight: .medium))
@@ -2074,13 +2215,38 @@ private struct RunCompletionWorkspace: View {
                             )
                     }
 
-                    VStack(alignment: .leading, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 16) {
                         Text(localized("Task results", "Taakresultaten"))
                             .font(.system(size: 22, weight: .bold, design: .rounded))
                             .foregroundStyle(AppPalette.textPrimary)
 
-                        ForEach(report.tasks) { item in
-                            RunCompletionTaskRow(task: item, tint: tint)
+                        Text(localized("The page summary stays above. Each action result is separated below so nothing gets mixed together.", "De paginasamenvatting blijft hierboven. Elk actieresultaat wordt hieronder apart gehouden zodat niets door elkaar loopt."))
+                            .font(.system(size: 13, weight: .medium))
+                            .foregroundStyle(AppPalette.textTertiary)
+                            .fixedSize(horizontal: false, vertical: true)
+
+                        if !issueTasks.isEmpty {
+                            RunCompletionTaskSection(
+                                title: localized("Needs attention", "Vraagt aandacht"),
+                                tasks: issueTasks,
+                                tint: AppPalette.error
+                            )
+                        }
+
+                        if !completedTasks.isEmpty {
+                            RunCompletionTaskSection(
+                                title: localized("Completed", "Voltooid"),
+                                tasks: completedTasks,
+                                tint: AppPalette.success
+                            )
+                        }
+
+                        if !skippedTasks.isEmpty {
+                            RunCompletionTaskSection(
+                                title: localized("Skipped", "Overgeslagen"),
+                                tasks: skippedTasks,
+                                tint: AppPalette.iceBlue
+                            )
                         }
                     }
                 }
@@ -2124,6 +2290,254 @@ private struct RunCompletionWorkspace: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(18)
         .background(DarkPanelBackground(tint: tint, isElevated: true))
+    }
+}
+
+private struct ModuleResultsOverview: View {
+    @EnvironmentObject private var viewModel: AppViewModel
+    let module: MaintenanceModule
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(localized("Page results", "Paginaresultaten"))
+                        .font(.system(size: 22, weight: .bold, design: .rounded))
+                        .foregroundStyle(AppPalette.textPrimary)
+
+                    Text(viewModel.selectedModuleResultSummary)
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(AppPalette.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Spacer(minLength: 12)
+            }
+
+            HStack(spacing: 16) {
+                miniResultMetric(
+                    title: localized("Done", "Klaar"),
+                    value: "\(viewModel.selectedModuleCompletedResultCount)",
+                    tint: AppPalette.success
+                )
+                miniResultMetric(
+                    title: localized("Skipped", "Overgeslagen"),
+                    value: "\(viewModel.selectedModuleSkippedResultCount)",
+                    tint: AppPalette.iceBlue
+                )
+                miniResultMetric(
+                    title: localized("Issues", "Problemen"),
+                    value: "\(viewModel.selectedModuleIssueResultCount)",
+                    tint: viewModel.selectedModuleIssueResultCount > 0 ? AppPalette.error : module.theme.accent
+                )
+            }
+        }
+        .padding(22)
+        .background(DarkPanelBackground(tint: module.theme.accent, isElevated: false))
+    }
+
+    private func miniResultMetric(title: String, value: String, tint: Color) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title.appLocalized.uppercased())
+                .font(.system(size: 10, weight: .bold, design: .rounded))
+                .kerning(1.1)
+                .foregroundStyle(AppPalette.textTertiary)
+
+            Text(value)
+                .font(.system(size: 26, weight: .bold, design: .rounded))
+                .foregroundStyle(AppPalette.textPrimary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(16)
+        .background(
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .fill(tint.opacity(0.08))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 20, style: .continuous)
+                        .stroke(tint.opacity(0.18), lineWidth: 1)
+                )
+        )
+    }
+}
+
+private struct RunCompletionTaskSection: View {
+    let title: String
+    let tasks: [RunTaskReport]
+    let tint: Color
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(title.appLocalized)
+                .font(.system(size: 15, weight: .bold, design: .rounded))
+                .foregroundStyle(AppPalette.textPrimary)
+
+            VStack(spacing: 12) {
+                ForEach(tasks) { item in
+                    RunCompletionTaskRow(task: item, tint: tint)
+                }
+            }
+        }
+    }
+}
+
+private struct MalwareThreatActionWorkspace: View {
+    @EnvironmentObject private var viewModel: AppViewModel
+    let tint: Color
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(localized("Threat review", "Dreigingscontrole"))
+                        .font(.system(size: 22, weight: .bold, design: .rounded))
+                        .foregroundStyle(AppPalette.textPrimary)
+
+                    Text(viewModel.malwareThreatCountLabel)
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(AppPalette.textSecondary)
+
+                    Text(viewModel.latestMalwareTargetSummary)
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(AppPalette.textTertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Spacer(minLength: 12)
+
+                Button(localized("Apply actions", "Acties toepassen")) {
+                    viewModel.applyMalwareThreatActions()
+                }
+                .buttonStyle(TaskActionButtonStyle(tint: tint))
+                .disabled(!viewModel.canApplyMalwareThreatActions)
+            }
+
+            VStack(spacing: 12) {
+                ForEach(viewModel.latestMalwareThreats) { threat in
+                    MalwareThreatCard(threat: threat, tint: tint)
+                }
+            }
+        }
+        .padding(22)
+        .background(DarkPanelBackground(tint: tint, isElevated: false))
+    }
+}
+
+private struct MalwareThreatCard: View {
+    @EnvironmentObject private var viewModel: AppViewModel
+    let threat: MalwareThreat
+    let tint: Color
+
+    private var resolution: MalwareThreatResolution {
+        viewModel.malwareThreatResolution(for: threat.id)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: "exclamationmark.shield.fill")
+                    .font(.system(size: 20, weight: .semibold))
+                    .foregroundStyle(AppPalette.error)
+                    .frame(width: 34, height: 34)
+                    .background(
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .fill(AppPalette.error.opacity(0.12))
+                    )
+
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(threat.signature)
+                        .font(.system(size: 15, weight: .bold, design: .rounded))
+                        .foregroundStyle(AppPalette.textPrimary)
+
+                    Text(threat.fileName)
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(AppPalette.textSecondary)
+
+                    Text(threat.path)
+                        .font(.system(size: 12, weight: .medium, design: .monospaced))
+                        .foregroundStyle(AppPalette.textTertiary)
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Spacer(minLength: 8)
+
+                StatusBadge(text: resolution.badgeText, tint: resolutionTint)
+            }
+
+            Picker(
+                localized("Threat action", "Dreigingsactie"),
+                selection: Binding(
+                    get: { viewModel.malwareThreatAction(for: threat) },
+                    set: { viewModel.setMalwareThreatAction($0, for: threat.id) }
+                )
+            ) {
+                ForEach(MalwareThreatActionChoice.allCases) { action in
+                    Text(action.title).tag(action)
+                }
+            }
+            .pickerStyle(.segmented)
+
+            Text(resolutionMessage)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(resolutionTextTint)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(18)
+        .background(
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .fill(Color.white.opacity(0.05))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 22, style: .continuous)
+                        .stroke(resolutionTint.opacity(0.16), lineWidth: 1)
+                )
+        )
+    }
+
+    private var resolutionTint: Color {
+        switch resolution {
+        case .pending:
+            return tint
+        case .ignored:
+            return AppPalette.iceBlue
+        case .quarantined:
+            return AppPalette.success
+        case .deleted:
+            return AppPalette.success
+        case .failed:
+            return AppPalette.error
+        }
+    }
+
+    private var resolutionTextTint: Color {
+        switch resolution {
+        case .failed:
+            return AppPalette.error.opacity(0.94)
+        case .quarantined, .deleted, .ignored:
+            return resolutionTint.opacity(0.94)
+        case .pending:
+            return AppPalette.textSecondary
+        }
+    }
+
+    private var resolutionMessage: String {
+        switch resolution {
+        case .pending:
+            return localized(
+                "Choose whether this detection should be ignored, moved into quarantine, or deleted permanently, then apply the actions above.",
+                "Kies of deze detectie moet worden genegeerd, naar quarantaine moet worden verplaatst of definitief moet worden verwijderd, en pas daarna de acties hierboven toe."
+            )
+        case .ignored:
+            return localized("This detection was left alone on disk.", "Deze detectie is ongemoeid op de schijf gelaten.")
+        case let .quarantined(destination):
+            return localized(
+                "Moved to quarantine:\n\(destination)",
+                "Verplaatst naar quarantaine:\n\(destination)"
+            )
+        case .deleted:
+            return localized("This detection was removed from disk.", "Deze detectie is van de schijf verwijderd.")
+        case let .failed(message):
+            return message
+        }
     }
 }
 
@@ -2332,6 +2746,50 @@ private struct TaskOutputPreview: View {
     }
 }
 
+private struct ChangelogTimelineCard: View {
+    let entries: [AppReleaseNoteEntry]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text(localized("Changelog", "Changelog"))
+                .font(.system(size: 18, weight: .bold, design: .rounded))
+                .foregroundStyle(AppPalette.textPrimary)
+
+            Text(localized("This timeline keeps the recent release history together instead of only showing the newest build.", "Deze tijdlijn houdt de recente releasegeschiedenis bij elkaar in plaats van alleen de nieuwste build te tonen."))
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(AppPalette.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            VStack(spacing: 12) {
+                ForEach(entries) { entry in
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(localized("Version \(entry.version)", "Versie \(entry.version)"))
+                            .font(.system(size: 14, weight: .bold, design: .rounded))
+                            .foregroundStyle(AppPalette.textPrimary)
+
+                        Text(localized(entry.englishBody, entry.dutchBody))
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(AppPalette.textSecondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(14)
+                    .background(
+                        RoundedRectangle(cornerRadius: 18, style: .continuous)
+                            .fill(Color.white.opacity(0.04))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                                    .stroke(Color.white.opacity(0.06), lineWidth: 1)
+                            )
+                    )
+                }
+            }
+        }
+        .padding(20)
+        .background(DarkPanelBackground(tint: AppPalette.violetGlow, isElevated: false))
+    }
+}
+
 private struct TaskCard: View {
     @EnvironmentObject private var viewModel: AppViewModel
     let task: MaintenanceTaskDefinition
@@ -2421,7 +2879,7 @@ private struct TaskCard: View {
                     Text(localized("Include", "Meenemen"))
                         .font(.system(size: 12, weight: .semibold))
                         .foregroundStyle(AppPalette.textPrimary)
-                    Text(task.estimatedTime.appLocalized)
+                    Text(task.estimatedDurationLabel)
                         .font(.system(size: 11, weight: .medium))
                         .foregroundStyle(AppPalette.textTertiary)
                 }
@@ -2629,7 +3087,7 @@ private struct DeveloperPreviewWorkspace: View {
                     viewModel.closeDeveloperPanel()
                 }
                 .buttonStyle(SecondaryGlassButtonStyle())
-                .keyboardShortcut(.cancelAction)
+                .keyboardShortcut("m", modifiers: [.command])
             }
             .padding(28)
 
@@ -2723,6 +3181,42 @@ private struct DeveloperPreviewWorkspace: View {
                                     tint: AppPalette.violetGlow,
                                     action: viewModel.playDeveloperDemoRun
                                 )
+                            }
+                        }
+                    }
+
+                    previewCard(title: "Hands-off demo", tint: AppPalette.violetGlow) {
+                        HStack(alignment: .center, spacing: 16) {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Auto Demo Tour")
+                                    .font(.system(size: 15, weight: .bold, design: .rounded))
+                                    .foregroundStyle(AppPalette.textPrimary)
+
+                                Text("Walk through the strongest pages and overlays automatically for screen recording, including review, update, about, progress, and a placebo run.")
+                                    .font(.system(size: 12, weight: .medium))
+                                    .foregroundStyle(AppPalette.textSecondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+
+                                Text("Shortcuts: Cmd+M opens or closes Preview Tools. Cmd+S starts or stops the tour.")
+                                    .font(.system(size: 11, weight: .medium))
+                                    .foregroundStyle(AppPalette.textTertiary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+
+                            Spacer(minLength: 12)
+
+                            if viewModel.isPlayingDeveloperTour {
+                                Button("Stop demo") {
+                                    viewModel.stopDeveloperAutoTour()
+                                }
+                                .buttonStyle(SecondaryGlassButtonStyle())
+                                .keyboardShortcut("s", modifiers: [.command])
+                            } else {
+                                Button("Start tour") {
+                                    viewModel.startDeveloperAutoTour()
+                                }
+                                .buttonStyle(TaskActionButtonStyle(tint: AppPalette.violetGlow))
+                                .keyboardShortcut("s", modifiers: [.command])
                             }
                         }
                     }
@@ -2916,13 +3410,7 @@ private struct AboutWorkspace: View {
                             "Deze tool is ontwikkeld met oog voor detail, gebruiksgemak en betrouwbaarheid door het team van EasyComp Zeeland. Speciale dank gaat uit naar Homebrew, ClamAV en alle open-source projecten die CleanMac Assistant mogelijk maken."
                         )
                     )
-                    aboutCard(
-                        title: localized("Changelog", "Changelog"),
-                        body: localized(
-                            "Version 1.0.12 improves updater reliability by recognizing release files such as V1.0.12 correctly and checking for updates again on launch without waiting for the old cooldown.",
-                            "Versie 1.0.12 verbetert de betrouwbaarheid van de updater door releasebestanden zoals V1.0.12 correct te herkennen en bij het opstarten opnieuw op updates te controleren zonder op de oude wachttijd te wachten."
-                        )
-                    )
+                    ChangelogTimelineCard(entries: AppReleaseNotes.entries)
                     aboutCard(
                         title: localized("Links and support", "Links en ondersteuning"),
                         body: localized(
@@ -3012,7 +3500,11 @@ private struct TaskReviewWorkspace: View {
                         .font(.system(size: 34, weight: .bold, design: .rounded))
                         .foregroundStyle(AppPalette.textPrimary)
 
-                    Text(localized("Review your selection before you start.", "Bekijk uw selectie voordat u start."))
+                    Text(
+                        task.id == .malware
+                            ? localized("Choose the scan areas before ClamAV starts. The scan itself only inspects these locations and waits for your decision if it finds threats.", "Kies de scangebieden voordat ClamAV start. De scan controleert alleen deze locaties en wacht op uw keuze als er dreigingen worden gevonden.")
+                            : localized("Review your selection before you start.", "Bekijk uw selectie voordat u start.")
+                    )
                         .font(.system(size: 14, weight: .medium))
                         .foregroundStyle(AppPalette.textSecondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -3084,18 +3576,22 @@ private struct TaskReviewWorkspace: View {
                     if !components.isEmpty {
                         HStack(alignment: .top) {
                             VStack(alignment: .leading, spacing: 4) {
-                                Text(localized("Choose exactly what to clean", "Kies precies wat u wilt opschonen"))
+                                Text(task.id == .malware ? localized("Choose what to scan", "Kies wat u wilt scannen") : localized("Choose exactly what to clean", "Kies precies wat u wilt opschonen"))
                                     .font(.system(size: 18, weight: .bold, design: .rounded))
                                     .foregroundStyle(AppPalette.textPrimary)
 
-                                Text(localized("You can leave parts unchecked if you want to keep that data on your Mac.", "U kunt onderdelen uitgevinkt laten als u die gegevens op uw Mac wilt behouden."))
+                                Text(
+                                    task.id == .malware
+                                        ? localized("Leave areas unchecked if you want a faster, narrower scan. Nothing is deleted during the scan itself.", "Laat gebieden uitgevinkt als u een snellere, smallere scan wilt. Tijdens de scan zelf wordt niets verwijderd.")
+                                        : localized("You can leave parts unchecked if you want to keep that data on your Mac.", "U kunt onderdelen uitgevinkt laten als u die gegevens op uw Mac wilt behouden.")
+                                )
                                     .font(.system(size: 13, weight: .medium))
                                     .foregroundStyle(AppPalette.textSecondary)
                             }
 
                             Spacer(minLength: 12)
 
-                            Button(localized("Safe pick", "Veilige keuze")) {
+                            Button(task.id == .malware ? localized("Recommended", "Aanbevolen") : localized("Safe pick", "Veilige keuze")) {
                                 viewModel.useSuggestedReviewComponents()
                             }
                             .buttonStyle(SecondaryGlassButtonStyle())
@@ -3155,7 +3651,7 @@ private struct TaskReviewWorkspace: View {
                 }
                 .buttonStyle(SecondaryGlassButtonStyle())
 
-                Button((confirmation?.confirmTitle ?? (components.isEmpty ? localized("Run Task", "Taak uitvoeren") : localized("Run Selected", "Selectie uitvoeren"))).appLocalized) {
+                Button((confirmation?.confirmTitle ?? (components.isEmpty ? localized("Run Task", "Taak uitvoeren") : (task.id == .malware ? localized("Start Scan", "Scan starten") : localized("Run Selected", "Selectie uitvoeren")))).appLocalized) {
                     viewModel.runReviewTask()
                 }
                 .buttonStyle(TaskActionButtonStyle(tint: tint))
@@ -3599,6 +4095,13 @@ private func componentItemText(_ itemCount: Int?) -> String? {
 }
 
 private func componentActionText(_ component: TaskScanComponent) -> String {
+    if component.role == .scanTarget {
+        return localized(
+            "This area will be included in the malware scan only. Nothing is removed until you review any found threats afterward.",
+            "Dit gebied wordt alleen meegenomen in de malwarescan. Er wordt niets verwijderd totdat u gevonden dreigingen daarna beoordeelt."
+        )
+    }
+
     switch component.cleanupAction {
     case .none:
         return localized("This part is shown for review only, so nothing is deleted until you open it yourself.", "Dit onderdeel wordt alleen ter controle getoond, dus er wordt niets verwijderd totdat u het zelf opent.")

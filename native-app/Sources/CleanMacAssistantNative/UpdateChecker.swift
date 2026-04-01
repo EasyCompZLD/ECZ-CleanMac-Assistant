@@ -143,6 +143,7 @@ struct UpdateChecker {
             let searchableText = href + " " + label
 
             guard downloadableExtensions.contains(where: { searchableText.lowercased().contains(".\($0)") }),
+                  artifactMatchesCurrentBuild(searchableText),
                   let version = extractVersion(from: searchableText),
                   let url = resolvedURL(from: href, relativeTo: repositoryURL)
             else {
@@ -159,6 +160,20 @@ struct UpdateChecker {
         }
 
         return bestMatch
+    }
+
+    private func artifactMatchesCurrentBuild(_ text: String) -> Bool {
+        let pattern = #"(?i)(?:^|[^a-z])(dev|developer)(?:[^a-z]|$)"#
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        let isDeveloperArtifact = (try? NSRegularExpression(pattern: pattern))?
+            .firstMatch(in: text, range: range) != nil
+
+        switch AppBuildFlavor.expectedArtifactKind {
+        case .release:
+            return !isDeveloperArtifact
+        case .developer:
+            return isDeveloperArtifact
+        }
     }
 
     private func resolvedURL(from href: String, relativeTo baseURL: URL) -> URL? {
@@ -210,68 +225,11 @@ struct UpdateChecker {
     }
 
     private func releaseNotes(for version: String) -> String {
-        switch normalizedVersion(version) {
-        case "1.0.12":
-            return localized(
-                "What's new\n• Update detection now understands release file names such as V1.0.12 instead of missing the version when it is prefixed with a V\n• Automatic update checks now run on app launch without waiting for the previous six-hour cooldown\n• A newly uploaded release should now surface as the in-app update popup more reliably\n• Release notes and packaging were refreshed for the updater reliability pass",
-                "Wat is er nieuw\n• Updatedetectie begrijpt nu bestandsnamen zoals V1.0.12 in plaats van de versie te missen zodra er een V voor staat\n• Automatische updatecontroles draaien nu bij het opstarten van de app zonder te wachten op de vorige zes-uurs cooldown\n• Een nieuw geuploade release hoort nu betrouwbaarder als updatepopup in de app te verschijnen\n• Release-notes en packaging zijn vernieuwd voor deze updater-betrouwbaarheidspass"
-            )
-        case "1.0.11":
-            return localized(
-                "What's new\n• Malware Scan now prepares its own local ClamAV signatures database in your user Library instead of relying on an empty Homebrew default folder\n• The app refreshes ClamAV signatures automatically when needed before starting a scan\n• Intel and Apple Silicon Macs now use the same calmer ClamAV setup flow\n• Protection copy was refreshed so the first-run database download is explained more clearly",
-                "Wat is er nieuw\n• Malwarescan bereidt nu zijn eigen lokale ClamAV-signaturedatabase voor in uw gebruikersbibliotheek in plaats van te vertrouwen op een lege standaardmap van Homebrew\n• De app ververst ClamAV-signatures nu automatisch wanneer dat nodig is voordat een scan start\n• Intel- en Apple Silicon-Macs gebruiken nu dezelfde rustigere ClamAV-opstartflow\n• De tekst in Bescherming is vernieuwd zodat de eerste database-download duidelijker wordt uitgelegd"
-            )
-        case "1.0.10":
-            return localized(
-                "What's new\n• Files now asks you to choose scan folders once instead of tripping repeated Desktop, Documents, and Downloads permission prompts\n• Large-file, duplicate, and installer reviews now stay inside the folders you explicitly connected\n• The Files page includes a clearer folder-access panel so the scan scope stays understandable\n• The release metadata was refreshed for the calmer file-access flow",
-                "Wat is er nieuw\n• Bestanden laat u nu één keer scanmappen kiezen in plaats van herhaalde toestemmingsmeldingen voor Bureaublad, Documenten en Downloads op te roepen\n• Controles op grote bestanden, duplicaten en installers blijven nu binnen de mappen die u expliciet hebt gekoppeld\n• De Bestanden-pagina heeft nu een duidelijkere maptoegangspagina zodat de scanscope begrijpelijk blijft\n• De release-metadata is vernieuwd voor deze rustigere bestands-toegangsflow"
-            )
-        case "1.0.9":
-            return localized(
-                "What's new\n• Applications now includes an installed-app picker for uninstall and preference reset tasks\n• You can choose real apps from the Mac instead of typing names or bundle identifiers manually\n• App removal is more reliable for items in both /Applications and ~/Applications\n• The applications flow now feels closer to a dedicated app manager while keeping the EasyComp updater and cleanup tools",
-                "Wat is er nieuw\n• Apps bevat nu een geïnstalleerde-appkiezer voor verwijderen en voorkeuren resetten\n• U kunt echte apps van de Mac kiezen in plaats van handmatig namen of bundle-identifiers te typen\n• App-verwijdering werkt nu betrouwbaarder voor onderdelen in zowel /Applications als ~/Applications\n• De apps-flow voelt nu meer als een echte appmanager, terwijl de EasyComp-updater en opschoonhulpmiddelen behouden blijven"
-            )
-        case "1.0.8":
-            return localized(
-                "What's new\n• Reworked app shell with a cleaner Home dashboard and quicker stats\n• Sidebar navigation now feels calmer and closer to a polished Mac cleaner layout\n• File, application, and maintenance routes are more focused while keeping the custom updater and EasyComp-specific tools\n• The About page and preview scenes now reflect the rebrand pass",
-                "Wat is er nieuw\n• Vernieuwde app-shell met een rustiger Home-dashboard en snellere statuskaarten\n• De navigatie links voelt nu kalmer en meer als een verzorgde Mac-cleaner-indeling\n• Bestands-, app- en onderhoudsroutes zijn gerichter geworden, terwijl de maatwerk-updater en EasyComp-tools behouden blijven\n• De Over-pagina en voorbeeldscenes tonen nu ook deze rebrand-pass"
-            )
-        case "1.0.7":
-            return localized(
-                "What's new\n• New calmer dashboard layout inspired by modern Mac cleaner apps\n• Applications now include an orphaned files review for leftover app data without a matching installed app\n• Task cards and module pages are less cluttered and easier to scan\n• The About page and developer preview scenes were refreshed for the new dashboard pass",
-                "Wat is er nieuw\n• Nieuwe rustigere dashboard-indeling, geinspireerd op moderne Mac-cleaners\n• Apps bevat nu een controle voor verweesde bestanden met appresten zonder bijbehorende geïnstalleerde app\n• Taakkaarten en paginaworkflows zijn minder druk en sneller te overzien\n• De Over-pagina en ontwikkelvoorbeelden zijn vernieuwd voor deze dashboard-pass"
-            )
-        case "1.0.6":
-            return localized(
-                "What's new\n• New installer cleanup review for DMG, PKG, and XIP files\n• Uninstall now removes common user-library leftovers after the app bundle is removed\n• Files review is better aligned with safer cleanup workflows inspired by modern open-source Mac cleaners\n• The About page and preview changelog now reflect the new cleanup tools",
-                "Wat is er nieuw\n• Nieuwe installer-opruimcontrole voor DMG-, PKG- en XIP-bestanden\n• Verwijderen van apps ruimt nu ook gebruikelijke restbestanden in de gebruikersbibliotheek op\n• Bestandscontrole sluit nu beter aan op veiligere opschoonflows uit moderne open-source Mac-cleaners\n• De Over-pagina en preview-changelog tonen nu ook deze nieuwe opschoonhulpmiddelen"
-            )
-        case "1.0.5":
-            return localized(
-                "What's new\n• Large and stale files can now be reviewed and removed inside the app\n• Duplicate scans now keep one suggested original and let you remove the extra copies\n• File review scenes are clearer for manual cleanup work\n• Developer preview data now mirrors the new file cleanup flow",
-                "Wat is er nieuw\n• Grote en verouderde bestanden kunnen nu in de app worden bekeken en verwijderd\n• Duplicaatscans bewaren nu één voorgesteld origineel en laten u de extra kopieën verwijderen\n• Bestandscontrole is duidelijker gemaakt voor handmatige opschoning\n• Voorbeelddata voor ontwikkelaars volgt nu de nieuwe bestandsopschoonflow"
-            )
-        case "1.0.4":
-            return localized(
-                "What's new\n• New in-app update popup when a newer version is found\n• Downloads and installs DMG releases automatically\n• Relaunches into the new version after the install helper finishes\n• Keeps the manual download option as a fallback",
-                "Wat is er nieuw\n• Nieuwe in-app updatepopup zodra er een nieuwere versie is\n• Downloadt en installeert DMG-releases automatisch\n• Start opnieuw op in de nieuwe versie zodra de updatehulp klaar is\n• Behoudt de handmatige downloadoptie als fallback"
-            )
-        case "1.0.3":
-            return localized(
-                "What's new\n• Fixed update checks for the EasyComp download folder\n• Calmer progress flow with a persistent results screen\n• Visible scroll bars and lighter card copy\n• Subtle completion sounds for steps and finished runs",
-                "Wat is er nieuw\n• Updatecontrole hersteld voor de EasyComp-downloadmap\n• Rustigere voortgangsflow met een blijvend resultaatscherm\n• Zichtbare scrollbalken en compactere teksten\n• Subtiele afrondgeluiden per stap en per run"
-            )
-        case "1.0.2":
-            return localized(
-                "What's new\n• Full-page progress workspace\n• Cleaner review flow\n• New About page\n• Live preview language switching\n• Repository-based update checks",
-                "Wat is er nieuw\n• Volledige voortgangswerkruimte\n• Rustigere reviewflow\n• Nieuwe Over-pagina\n• Live taalwissel in preview\n• Updatecontrole via de repository"
-            )
-        default:
-            return localized(
+        AppReleaseNotes.notes(for: normalizedVersion(version))
+            ?? localized(
                 "A newer app build was found in the EasyComp download folder.",
                 "Er is een nieuwere appversie gevonden in de EasyComp-downloadmap."
             )
-        }
     }
 
     private func normalizedVersion(_ version: String) -> String {
